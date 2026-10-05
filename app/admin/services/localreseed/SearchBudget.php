@@ -22,6 +22,12 @@ final class SearchBudget
     private readonly float $startTime;
 
     /**
+     * 相邻请求最小间隔(秒)，可被站点限速配置抬升
+     * @var int
+     */
+    private int $interval;
+
+    /**
      * @param int $maxRunSeconds 单轮时间预算(秒)
      * @param int $maxRequests 每站每轮最大请求数
      * @param int $interval 相邻请求最小间隔(秒)
@@ -29,9 +35,10 @@ final class SearchBudget
     public function __construct(
         private readonly int $maxRunSeconds,
         private readonly int $maxRequests,
-        private readonly int $interval
+        int $interval
     )
     {
+        $this->interval = $interval;
         $this->startTime = microtime(true);
     }
 
