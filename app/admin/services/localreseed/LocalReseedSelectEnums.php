@@ -1,28 +1,16 @@
 <?php
 
-namespace app\model\enums;
+namespace app\admin\services\localreseed;
 
 /**
- * 自动辅种业务子类型枚举类
+ * 计划任务：本地辅种配置选择框
  */
-enum ReseedSubtypeEnums: int
+enum LocalReseedSelectEnums: int
 {
     /**
-     * 自动辅种
+     * webman命令
      */
-    case Default = 0;
-    /**
-     * 自动下载
-     */
-    case Downloader = 1;
-    /**
-     * 自动转移
-     */
-    case Transfer = 2;
-    /**
-     * 本地辅种
-     */
-    case Local = 3;
+    case localReseed = 13;
 
     /**
      * 枚举的文本描述
@@ -32,10 +20,7 @@ enum ReseedSubtypeEnums: int
     public static function text(self $enum): string
     {
         return match ($enum) {
-            self::Default => '自动辅种',
-            self::Downloader => '自动下载',
-            self::Transfer => '自动转移',
-            self::Local => '本地辅种',
+            self::localReseed => '本地辅种',
         };
     }
 

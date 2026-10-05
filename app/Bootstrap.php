@@ -4,6 +4,8 @@ namespace app;
 
 use app\admin\services\client\ClientServices;
 use app\admin\services\download\DownloaderServices;
+use app\admin\services\localreseed\CrontabObserver as LocalReseedCrontabObserver;
+use app\admin\services\localreseed\LocalReseedTemplate;
 use app\admin\services\reseed\CrontabObserver;
 use app\admin\services\reseed\ReseedTemplate;
 use app\admin\services\rss\RssTemplate;
@@ -63,6 +65,7 @@ class Bootstrap implements \Webman\Bootstrap
         Crontab::observe(CrontabObserver::class);
         Crontab::observe(TransferCrontabObserver::class);
         Crontab::observe(RssCrontabObserver::class);
+        Crontab::observe(LocalReseedCrontabObserver::class);
         Folder::observe(FolderObserver::class);
         Reseed::observe(ReseedObserver::class);
         Site::observe(SiteObserver::class);
@@ -79,6 +82,7 @@ class Bootstrap implements \Webman\Bootstrap
         CrontabExtend::getInstance()
             ->register(new ReseedTemplate())
             ->register(new TransferTemplate())
-            ->register(new RssTemplate());
+            ->register(new RssTemplate())
+            ->register(new LocalReseedTemplate());
     }
 }

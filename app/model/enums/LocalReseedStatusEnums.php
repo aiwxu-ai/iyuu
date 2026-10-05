@@ -3,26 +3,34 @@
 namespace app\model\enums;
 
 /**
- * 自动辅种业务子类型枚举类
+ * 本地辅种状态枚举
  */
-enum ReseedSubtypeEnums: int
+enum LocalReseedStatusEnums: int
 {
     /**
-     * 自动辅种
+     * 待搜索
      */
-    case Default = 0;
+    case Pending = 0;
     /**
-     * 自动下载
+     * 搜索中
      */
-    case Downloader = 1;
+    case Matching = 1;
     /**
-     * 自动转移
+     * 无匹配
      */
-    case Transfer = 2;
+    case NoMatch = 2;
     /**
-     * 本地辅种
+     * 已命中
      */
-    case Local = 3;
+    case Matched = 3;
+    /**
+     * 失败
+     */
+    case Failed = 4;
+    /**
+     * 跳过
+     */
+    case Skipped = 5;
 
     /**
      * 枚举的文本描述
@@ -32,10 +40,12 @@ enum ReseedSubtypeEnums: int
     public static function text(self $enum): string
     {
         return match ($enum) {
-            self::Default => '自动辅种',
-            self::Downloader => '自动下载',
-            self::Transfer => '自动转移',
-            self::Local => '本地辅种',
+            self::Pending => '待搜索',
+            self::Matching => '搜索中',
+            self::NoMatch => '无匹配',
+            self::Matched => '已命中',
+            self::Failed => '失败',
+            self::Skipped => '跳过',
         };
     }
 
