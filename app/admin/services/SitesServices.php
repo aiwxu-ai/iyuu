@@ -20,6 +20,23 @@ class SitesServices
     public const string SYSTEM_IYUU_HELPER = 'system_iyuu_helper';
 
     /**
+     * 客户端内置站点（IYUU服务端未收录）
+     * - sid使用负数，避免与服务端分配的sid冲突
+     * - 结构与辅种服务器返回的站点数据保持一致
+     */
+    private const array LOCAL_SITES = [
+        '52movie' => [
+            'id' => -1,
+            'nickname' => '52Movie',
+            'base_url' => 'www.52movie.top',
+            'download_page' => 'download.php?id={}&passkey={passkey}',
+            'details_page' => 'details.php?id={}',
+            'is_https' => 1,
+            'cookie_required' => 0,
+        ],
+    ];
+
+    /**
      * 获取IYUU 浏览器助手密钥
      * @return Option
      */
@@ -47,7 +64,7 @@ class SitesServices
             }
 
             $reseedClient = iyuu_reseed_client();
-            $list = $reseedClient->sites();
+            $list = array_merge($reseedClient->sites(), self::LOCAL_SITES);
             file_put_contents(runtime_path('sync.json'), json_encode($list, JSON_UNESCAPED_UNICODE));
             foreach ($list as $site => $item) {
                 $siteModel = Site::uniqueSite($site);

@@ -126,6 +126,7 @@ class LayuiTemplate
             'keepfrds' => Decorator::make([NexusPHP::class, OptionsUrlJoin::class, OptionsLimit::class], $default),
             'yemapt' => Decorator::make([OptionsRssUrl::class], $default),
             'ttg' => Decorator::make([NexusPHP::class, OptionsLimit::class, OptionsRssUrl::class], $default),
+            '52movie' => Decorator::make([NexusPHP::class, OptionsLimit::class, OptionsRssUrl::class], $default),
             'redleaves', 'pter', 'pt', 'hdsky', 'ssd', 'lemonhd' => Decorator::make([NexusPHP::class, OptionsLimit::class], $default),
             'hdpost', 'monikadesign' => Decorator::make([NexusPHP::class, OptionsRsskey::class, OptionsRssUrl::class], $default),
             'dicmusic',
