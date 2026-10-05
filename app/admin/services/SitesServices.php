@@ -21,12 +21,12 @@ class SitesServices
 
     /**
      * 客户端内置站点（IYUU服务端未收录）
-     * - sid使用负数，避免与服务端分配的sid冲突
+     * - sid使用0，避免与服务端分配的sid冲突（列无符号，不能用负数）
      * - 结构与辅种服务器返回的站点数据保持一致
      */
     private const array LOCAL_SITES = [
         '52movie' => [
-            'id' => -1,
+            'id' => 0,
             'nickname' => '52Movie',
             'base_url' => 'www.52movie.top',
             'download_page' => 'download.php?id={}&passkey={passkey}',
