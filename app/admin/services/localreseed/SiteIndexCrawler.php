@@ -48,10 +48,13 @@ final class SiteIndexCrawler
         $state = SiteIndex::getOrNew($this->site->sid, $this->site->site);
         $state->last_time = time();
 
+        // 全库模式断点续建：从上次最大页码+1继续翻深；增量模式（或全库已完成）从第0页追新
+        $resume = $fullMode && !(1 === (int)$state->full_done) && (int)$state->last_page >= 0;
+        $page = $resume ? ((int)$state->last_page + 1) : 0;
+
         $pages = 0;
         $newRows = 0;
         $fullDone = false;
-        $page = 0;
         while ($pages < $maxPages && $this->budget->allow($this->site->site)) {
             $html = $this->fetchPage($page);
             $this->budget->hit($this->site->site);

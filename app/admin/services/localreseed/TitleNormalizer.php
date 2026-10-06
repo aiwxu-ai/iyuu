@@ -19,6 +19,10 @@ final class TitleNormalizer
         $key = mb_strtolower(trim($key));
         // 去除常见修饰标记
         $key = preg_replace('/\[置顶\]|\[热门\]|@本站限定/iu', '', $key) ?? $key;
+        // 剥离前导的中文标题括号段：[赛马娘.芦毛灰姑娘].Umamusume... → umasmusume...
+        $key = preg_replace('/^[\[【][^\]】]*[\]】][\s.]*/u', '', $key) ?? $key;
+        // 剥离尾部的站水印修饰：...中英特效字幕￡CMCT南瓜 → 去掉￡及之后
+        $key = preg_replace('/[￡￥#@].{0,20}$/u', '', $key) ?? $key;
         // 分隔符统一为单个空格
         $key = preg_replace('/[._\s\-—–]+/u', ' ', $key) ?? $key;
         // 压缩空白
