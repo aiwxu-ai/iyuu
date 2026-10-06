@@ -57,6 +57,20 @@ CREATE TABLE IF NOT EXISTS `cn_local_reseed` (
   KEY `idx_target_sid` (`target_sid`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本地搜索式辅种进度';
 
+CREATE TABLE IF NOT EXISTS `cn_site_request_ledger` (
+  `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+  `site` varchar(30) NOT NULL COMMENT '站点名称',
+  `day` date NOT NULL COMMENT '记账日',
+  `requests` int(10) UNSIGNED NOT NULL DEFAULT '0' COMMENT '当日请求数(含失败)',
+  `last_ts` int(10) UNSIGNED NOT NULL DEFAULT '0' COMMENT '最近请求时间戳',
+  `consec_fail` tinyint(3) UNSIGNED NOT NULL DEFAULT '0' COMMENT '连续失败次数',
+  `cooldown_until` int(10) UNSIGNED NOT NULL DEFAULT '0' COMMENT '熔断截止时间戳',
+  `created_at` datetime DEFAULT NULL COMMENT '创建时间',
+  `updated_at` datetime DEFAULT NULL COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_site` (`site`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='站点请求全局台账';
+
 CREATE TABLE IF NOT EXISTS `cn_site_torrent` (
   `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
   `sid` int(10) UNSIGNED NOT NULL COMMENT '站点ID',

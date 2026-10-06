@@ -85,6 +85,27 @@ class LocalReseed extends Base
     }
 
     /**
+     * 终态同步到兄弟行：同hash同站在多个下载器各有一行，一处得出结论全家共享
+     * （跨轮的去重通道：进程内verifyCache只在单轮有效）
+     * @param string $infoHash
+     * @param int $targetSid
+     * @param int $exceptId 已单独落库的行ID
+     * @param array $attrs 要同步的字段
+     * @return int 影响行数
+     */
+    public static function syncSiblings(string $infoHash, int $targetSid, int $exceptId, array $attrs): int
+    {
+        if (empty($attrs)) {
+            return 0;
+        }
+        return static::where('info_hash', '=', $infoHash)
+            ->where('target_sid', '=', $targetSid)
+            ->where('id', '<>', $exceptId)
+            ->where('status', '=', LocalReseedStatusEnums::Pending->value)
+            ->update($attrs);
+    }
+
+    /**
      * 同步本地做种种子到进度表（幂等，唯一键去重）
      * @param int $crontab_id
      * @param int $client_id

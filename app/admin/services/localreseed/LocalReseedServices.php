@@ -30,6 +30,10 @@ use Throwable;
  * 本地辅种服务（索引模式）
  * - 阶段A 建库：翻页抓取目标站种子索引到 cn_site_torrent（请求只花在这里）
  * - 阶段B 匹配：本地做种种子 vs 索引库 本地比对（零请求），命中候选下载元数据做字节级确认
+ *   - 第一遍：标题键全等（title_key 或 latin第二键）——精度最高，优先吃校验预算
+ *   - 第二遍：体积桶+token（默认关闭bucket_match，假阳性/请求比差2-3个数量级）
+ * - 阶段A2 关键词引导搜索：IYUU跨站已验证hash用特征词单token搜索，直达索引未覆盖区
+ * - 终裁标准：元数据infohash === 本地infohash（跨站辅种的定义）；体积只是预筛
  * - 命中写入 cn_reseed 队列，复用现有投递管线
  */
 final class LocalReseedServices
@@ -45,7 +49,11 @@ final class LocalReseedServices
     /**
      * 相邻请求最小间隔默认值(秒)
      */
-    public const int DEFAULT_INTERVAL = 5;
+    public const int DEFAULT_INTERVAL = 10;
+    /**
+     * 每站每日请求硬上限默认值(台账强制，含失败)
+     */
+    public const int DEFAULT_DAILY_REQUESTS = 800;
     /**
      * 每个本地种子最多校验的候选数默认值
      */
@@ -59,11 +67,15 @@ final class LocalReseedServices
      */
     public const int SEARCH_GUIDED_REQUEUE_SECONDS = 43200;
     /**
-     * 搜索词排除的通用词（无区分度）
+     * 引导搜索最多占用本站时间片的40%（剩余留给元数据校验）
+     */
+    protected const float SEARCH_GUIDED_SLICE_RATIO = 0.4;
+    /**
+     * 搜索词排除的通用词（无区分度；分辨率/编码类token由结构正则排除）
      */
     protected const array SEARCH_STOPWORDS = ['the', 'and', 'for', 'with', 'from', 'into', 'season', 'complete', 'multi', 'audio', 'dual', 'proper', 'repack', 'extended', 'remastered', 'internal', 'limited', 'unrated', 'runtime', 'subbed', 'chinese', 'english', 'jun', 'part',
-        'bluray', 'blu', 'ray', 'uhd', 'hdr', 'dolby', 'vision', 'remux', 'flac', 'ddp', 'dts', 'ac3', 'ma', 'hevc', 'x264', 'x265', 'h264', 'h265', 'avc', 'web', 'webdl', 'hdtv', 'atmos', 'imax', 'hack', 'hackui', 'iuvc', 'hq', 'tenbit', 'ddp5',
-        'movie', 'movies', 'film', 'films', 'series', 'show', 'ep', 'episode', 'episodes', 'vivid', 'hybrid', 'nv', '出品', '中字', '国语', '粤语', '双语'];
+        'bluray', 'blu', 'ray', 'uhd', 'hdr', 'dolby', 'vision', 'remux', 'flac', 'ddp', 'dts', 'ac3', 'ma', 'hevc', 'x264', 'x265', 'h264', 'h265', 'avc', 'web', 'webdl', 'hdtv', 'atmos', 'imax', 'hack', 'hackui', 'iuvc', 'hq', '10bit', 'webrip', 'bdrip', 'dvdrip', 'hdrip', 'truehd', '60fps', 'dovi',
+        'movie', 'movies', 'film', 'films', 'series', 'show', 'ep', 'episode', 'episodes', 'vivid', 'hybrid', 'nv'];
 
     /**
      * 计划任务：数据模型
@@ -114,7 +126,7 @@ final class LocalReseedServices
      */
     protected int $incldead = 1;
     /**
-     * 搜索预算
+     * 搜索预算（含跨进程全局台账）
      */
     protected SearchBudget $budget;
     /**
@@ -130,12 +142,23 @@ final class LocalReseedServices
      */
     protected bool $fullIndex = false;
     /**
+     * 体积桶+token路径开关（默认关：黄金子集上边际贡献0.44%而假阳性≈100%）
+     */
+    protected bool $bucketMatch = false;
+    /**
+     * 站点级校验结果缓存 site => hash => ['ok'=>[tid,siteHash,name], 'no'=>[tid...]]
+     * （进程内跨阶段共享：matchLocal得出的结论searchGuided直接复用）
+     */
+    protected array $siteVerifyCache = [];
+    /**
      * 统计
      */
     protected int $statNewRows = 0;
     protected int $statIndexNew = 0;
     protected int $statSearchGuided = 0;
     protected int $statSearchIngest = 0;
+    protected int $statVerify = 0;
+    protected int $statMatchedHashes = 0;
     protected int $statMatched = 0;
     protected int $statNoMatch = 0;
     protected int $statFailed = 0;
@@ -161,6 +184,11 @@ final class LocalReseedServices
             return;
         }
 
+        // 索引量少的站优先（新站空索引先建库；避免大站独吞本轮时间预算）
+        $sizes = SiteIndex::whereIn('sid', array_column(array_values($this->targetSites), 'sid'))
+            ->pluck('total_indexed', 'sid')->toArray();
+        uasort($this->targetSites, static fn(Site $a, Site $b) => ($sizes[$a->sid] ?? 0) <=> ($sizes[$b->sid] ?? 0));
+
         // 崩溃恢复
         LocalReseed::resetMatching();
 
@@ -184,7 +212,13 @@ final class LocalReseedServices
             }
         }
 
+        $remainingSites = count($this->targetSites);
         foreach ($this->targetSites as $site) {
+            // 时间分片：剩余时间均分给剩余站点，防止某站独吞整轮预算
+            $this->budget->setSiteDeadline($this->budget->remainingSeconds() / max(1, $remainingSites));
+            $this->siteVerifyCache = [];
+            $remainingSites--;
+
             // 阶段A 建库
             $this->buildIndex($site);
             // 阶段B 本地匹配（标题键候选精度最高，优先吃校验预算）
@@ -227,7 +261,6 @@ final class LocalReseedServices
         } catch (CookieInvalidException $exception) {
             echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
             NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
-            return;
         } catch (Throwable $throwable) {
             echo "站点 {$site->nickname} 建库异常：" . $throwable->getMessage() . PHP_EOL;
             NotifyAdmin::warning("站点 {$site->site} 建库异常：" . mb_substr($throwable->getMessage(), 0, 300));
@@ -237,9 +270,9 @@ final class LocalReseedServices
     /**
      * 阶段A2：关键词引导搜索（IYUU-hash优先，直接匹配）
      * - IYUU官方辅种成功的hash（cn_reseed记录）= 已确认在其他站存在 → 大概率目标站也有
-     * - 对这批本地种子用特征词做站内单token搜索：结果入库索引 + 体积吻合候选当场元数据校验入队
+     * - 按hash去重后逐个用特征词做站内单token搜索：结果入库索引 + 体积吻合候选当场infohash裁决入队
      * - NexusPHP的search是整串模糊匹配，多词短语必然零结果，故只取一个最具区分度的词
-     * - 校验在本阶段内完成（搜索结果就是为本行服务的），不依赖阶段B的剩余预算
+     * - 最多占用本站时间片的40%，剩余留给元数据校验
      * @param Site $site
      * @return void
      */
@@ -260,22 +293,32 @@ final class LocalReseedServices
             return;
         }
 
+        // 本站时间片内引导搜索的截止
+        $guidedDeadline = microtime(true) + ($this->budget->remainingSeconds() * self::SEARCH_GUIDED_SLICE_RATIO);
         $minTs = time() - self::SEARCH_GUIDED_REQUEUE_SECONDS;
         $lastId = 0;
         $searched = 0;
         $ingested = 0;
         $firstError = '';
-        while (!$this->budget->timeUp() && $this->budget->allow($site->site)) {
-            /** @var LocalReseed[] $rows 只处理IYUU已跨站验证过的hash */
-            $rows = LocalReseed::where('target_sid', '=', $site->sid)
+        while (!$this->budget->timeUp() && !$this->budget->siteSliceUp() && $this->budget->allow($site->site)) {
+            if (microtime(true) >= $guidedDeadline) {
+                echo "站点 {$site->nickname} 引导搜索：已到本站时间片40%配额，剩余留给元数据校验" . PHP_EOL;
+                break;
+            }
+
+            /** @var LocalReseed[] $rows 只处理IYUU已跨站验证过的hash，按hash去重（每hash取代表行） */
+            $ids = LocalReseed::where('target_sid', '=', $site->sid)
                 ->where('status', '=', LocalReseedStatusEnums::Pending->value)
                 ->where('torrent_size', '>', 0)
                 ->where('search_time', '<', $minTs)
                 ->whereRaw("EXISTS (SELECT 1 FROM cn_reseed r WHERE r.info_hash = cn_local_reseed.info_hash AND r.info_hash <> '')")
                 ->where('id', '>', $lastId)
+                ->selectRaw('MIN(id) AS id')
+                ->groupBy('info_hash')
                 ->orderBy('id')
                 ->limit(50)
-                ->get();
+                ->pluck('id');
+            $rows = $ids->isEmpty() ? collect() : LocalReseed::whereIn('id', $ids->all())->orderBy('id')->get();
             if ($rows->isEmpty()) {
                 if (0 === $searched) {
                     echo "站点 {$site->nickname} 引导搜索：无可搜索行（已搜空或12小时内已搜）" . PHP_EOL;
@@ -285,8 +328,14 @@ final class LocalReseedServices
 
             foreach ($rows as $row) {
                 $lastId = (int)$row->id;
-                if ($this->budget->timeUp() || !$this->budget->allow($site->site)) {
+                if ($this->budget->timeUp() || $this->budget->siteSliceUp() || !$this->budget->allow($site->site) || microtime(true) >= $guidedDeadline) {
                     break 2;
+                }
+
+                // hash级短路：本进程内已有结论
+                $hash = (string)$row->info_hash;
+                if (isset($this->siteVerifyCache[$hash]['ok'])) {
+                    continue;
                 }
 
                 $token = $this->pickSearchToken((string)$row->torrent_name);
@@ -315,19 +364,18 @@ final class LocalReseedServices
                 $row->candidates = count($resultRows);
                 $row->search_time = time();
 
-                // 体积吻合候选：当场下载元数据做字节级裁决（免费优先）
+                // 体积吻合候选：当场下载元数据做infohash裁决（体积差升序）
                 $localSize = (int)$row->torrent_size;
                 $cands = array_values(array_filter($resultRows, static fn($c) => (int)$c['size_bytes'] > 0 && TitleNormalizer::sizeClose((int)$c['size_bytes'], $localSize)));
-                if (!empty($cands)) {
-                    usort($cands, static fn($a, $b) => ($b['free'] <=> $a['free']));
-                }
+                usort($cands, static fn($a, $b) => abs((int)$a['size_bytes'] - $localSize) <=> abs((int)$b['size_bytes'] - $localSize));
                 foreach (array_slice($cands, 0, 2) as $cand) {
                     if (!$this->budget->allow($site->site)) {
                         break;
                     }
                     $this->budget->hit($site->site);
+                    $this->statVerify++;
                     try {
-                        $result = $verifyServices->verify($cand, $localSize);
+                        $result = $verifyServices->verify($cand, $localSize, $hash);
                     } catch (CookieInvalidException $exception) {
                         $row->message = mb_substr($exception->getMessage(), 0, 900);
                         $row->save();
@@ -339,10 +387,14 @@ final class LocalReseedServices
                     }
 
                     if (LocalReseedStatusEnums::Matched === $result->status) {
-                        $this->enqueue($row, $site, $result);
-                        $this->statMatched++;
+                        $this->enqueueFamily($row, $site, $result);
+                        $this->siteVerifyCache[$hash]['ok'] = [(int)$result->torrentId, $result->infoHash, (string)$result->name];
                         break;
                     }
+                    if (LocalReseedStatusEnums::NoMatch === $result->status) {
+                        $this->siteVerifyCache[$hash]['no'][] = (int)$cand['torrent_id'];
+                    }
+                    // Failed(瞬时失败)不记录——下一轮自然重试
                 }
 
                 if (LocalReseedStatusEnums::Matched->value !== (int)$row->status) {
@@ -354,7 +406,7 @@ final class LocalReseedServices
         if ($searched > 0) {
             $this->statSearchGuided += $searched;
             $this->statSearchIngest += $ingested;
-            echo "站点 {$site->nickname} 关键词引导：搜索 {$searched} 次 补充索引 {$ingested} 条 命中 {$this->statMatched}" . ($firstError ? ' 首个异常：' . mb_substr($firstError, 0, 200) : '') . PHP_EOL;
+            echo "站点 {$site->nickname} 关键词引导：搜索 {$searched} 次 补充索引 {$ingested} 条" . ($firstError ? ' 首个异常：' . mb_substr($firstError, 0, 200) : '') . PHP_EOL;
         } elseif ('' !== $firstError) {
             echo "站点 {$site->nickname} 引导搜索全部异常，首个：" . mb_substr($firstError, 0, 300) . PHP_EOL;
             NotifyAdmin::warning("站点 {$site->site} 引导搜索全部异常：" . mb_substr($firstError, 0, 300));
@@ -379,6 +431,10 @@ final class LocalReseedServices
             if (!preg_match('/^[a-z][a-z0-9\']{3,}$/', $token)) {
                 continue;    // 跳过中文、纯数字、短词
             }
+            // 结构性排除：集数/盘符/分辨率等无区分度token（对整站霰弹枪搜索）
+            if (preg_match('/^(s\d+e\d+|e\d{1,3}|s\d+|disc?\d+|\d{3,4}p|\d+bit|\d+fps)$/', $token)) {
+                continue;
+            }
             if (in_array($token, self::SEARCH_STOPWORDS, true)) {
                 continue;
             }
@@ -394,23 +450,26 @@ final class LocalReseedServices
 
     /**
      * 阶段B：本地匹配（零站点请求，命中候选才下载元数据确认）
+     * - 第一遍标题键全等（title_key 或 latin第二键），第二遍体积桶（bucket_match开关控制）
      * - 索引持续增长，无匹配不落终态（始终可重跑）
-     * - 已核验不符的候选ID记录在message，避免重复下载元数据
+     * - 已核不符的候选ID记录在message，瞬时失败(待重试)不掩埋候选
      * @param array $client_ids
      * @param Site $site
      * @return void
      */
     protected function matchLocal(array $client_ids, Site $site): void
     {
-        echo "本地匹配开始 预算已用 {$this->budget->used($site->site)} 时间剩余 " . (int)($this->budget->remainingSeconds()) . "s" . PHP_EOL;
-        // 载入站点索引到内存：title_key => 候选行列表
+        echo "本地匹配开始 预算已用 {$this->budget->used($site->site)} 时间剩余 " . (int)$this->budget->remainingSeconds() . "s" . PHP_EOL;
         $t0 = microtime(true);
+
+        // 载入站点索引：title_key => 行列表 + latin第二键（站内"中文.English"名的拉丁尾部）
         $index = [];
+        $latinIndex = [];
         SiteTorrent::getBySid($site->sid)
             ->select(['torrent_id', 'title', 'title_key', 'size_bytes', 'free', 'download_uri'])
-            ->chunk(1000, function ($chunk) use (&$index) {
+            ->chunk(1000, function ($chunk) use (&$index, &$latinIndex) {
                 foreach ($chunk as $row) {
-                    $index[$row->title_key][] = [
+                    $c = [
                         'torrent_id' => (int)$row->torrent_id,
                         'title' => (string)$row->title,
                         'title_key' => (string)$row->title_key,
@@ -418,6 +477,11 @@ final class LocalReseedServices
                         'free' => (int)$row->free,
                         'download_uri' => (string)$row->download_uri,
                     ];
+                    $index[$row->title_key][] = $c;
+                    $lk = TitleNormalizer::latinKey((string)$row->title);
+                    if ('' !== $lk && $lk !== (string)$row->title_key) {
+                        $latinIndex[$lk][] = $c;
+                    }
                 }
             });
         if (empty($index)) {
@@ -439,15 +503,15 @@ final class LocalReseedServices
         echo "索引载入 " . count($index) . "键/" . count($sizeKeys) . "桶 耗时 " . round(microtime(true) - $t0, 1) . "s" . PHP_EOL;
 
         $verifyServices = new SiteSearchServices($site);
-        // 两遍扫描：第一遍只处理标题键全等行(精度最高，优先吃校验预算)，第二遍体积桶行
-        // verifyCache: 同一种子多客户端各有一行，元数据校验结果按info_hash共享，避免重复下载
-        $verifyCache = [];
         foreach ([true, false] as $passExact) {
-            if ($this->budget->timeUp()) {
+            if ($this->budget->timeUp() || $this->budget->siteSliceUp()) {
                 break;
             }
+            if (!$passExact && !$this->bucketMatch) {
+                continue;    // 体积桶路径默认关闭
+            }
             echo ($passExact ? '扫描第一遍：标题键全等行' : '扫描第二遍：体积桶行') . PHP_EOL;
-            $this->scanRows($client_ids, $site, $index, $bySize, $sizeKeys, $verifyServices, $passExact, $verifyCache);
+            $this->scanRows($client_ids, $site, $index, $latinIndex, $bySize, $sizeKeys, $verifyServices, $passExact);
         }
     }
 
@@ -455,26 +519,33 @@ final class LocalReseedServices
      * 扫描并校验一批进度行
      * @param array $client_ids
      * @param Site $site
-     * @param array $index
+     * @param array $index title_key => 候选行
+     * @param array $latinIndex latinKey => 候选行（站内中文名的拉丁尾部）
      * @param array $bySize
      * @param array $sizeKeys
      * @param SiteSearchServices $verifyServices
      * @param bool $passExact 本遍是否只处理标题键全等行
-     * @param array $verifyCache info_hash => ['ok'=>[tid,title], 'no'=>[tid...]]
      * @return void
      */
-    protected function scanRows(array $client_ids, Site $site, array $index, array $bySize, array $sizeKeys, SiteSearchServices $verifyServices, bool $passExact, array &$verifyCache): void
+    protected function scanRows(array $client_ids, Site $site, array $index, array $latinIndex, array $bySize, array $sizeKeys, SiteSearchServices $verifyServices, bool $passExact): void
     {
         $lastId = 0;
         $statCandidates = 0;
-        while (!$this->budget->timeUp()) {
+        $verifyCache = &$this->siteVerifyCache;
+        // NOT EXISTS 的client_id必须与enqueue实际落库口径一致（master设置时入队到master）
+        $reseedClientId = $this->masterModel ? (int)$this->masterModel->id : -1;
+        while (!$this->budget->timeUp() && !$this->budget->siteSliceUp()) {
             /** @var LocalReseed[] $rows 无匹配(2)与失败(4)均可重跑（索引会增长）
              *  排除已在cn_reseed存在同客户端同hash的行（该客户端已辅过此种子） */
-            $rows = LocalReseed::where('target_sid', '=', $site->sid)
+            $query = LocalReseed::where('target_sid', '=', $site->sid)
                 ->whereIn('client_id', $client_ids)
-                ->whereIn('status', [LocalReseedStatusEnums::Pending->value, LocalReseedStatusEnums::NoMatch->value, LocalReseedStatusEnums::Failed->value])
-                ->whereRaw("NOT EXISTS (SELECT 1 FROM cn_reseed cr WHERE cr.client_id = cn_local_reseed.client_id AND cr.info_hash = cn_local_reseed.info_hash)")
-                ->where('id', '>', $lastId)
+                ->whereIn('status', [LocalReseedStatusEnums::Pending->value, LocalReseedStatusEnums::NoMatch->value, LocalReseedStatusEnums::Failed->value]);
+            if ($reseedClientId > 0) {
+                $query->whereRaw("NOT EXISTS (SELECT 1 FROM cn_reseed cr WHERE cr.client_id = {$reseedClientId} AND cr.info_hash = cn_local_reseed.info_hash)");
+            } else {
+                $query->whereRaw('NOT EXISTS (SELECT 1 FROM cn_reseed cr WHERE cr.client_id = cn_local_reseed.client_id AND cr.info_hash = cn_local_reseed.info_hash)');
+            }
+            $rows = $query->where('id', '>', $lastId)
                 ->orderBy('id')
                 ->limit(300)
                 ->get();
@@ -491,21 +562,43 @@ final class LocalReseedServices
                     continue;
                 }
 
-                // 候选查找：标题键完全相等（快速路径）+ 体积区间（页面舍入容差）
-                $candidates = $index[$key] ?? [];
-                $hasExact = 0 !== count($candidates);
-                if ($passExact !== $hasExact) {
-                    continue;    // 本遍不处理：全等行只在第一遍、桶行只在第二遍
+                // hash级短路：同hash行本进程内已有终态结论
+                $hash = (string)$row->info_hash;
+                if (isset($verifyCache[$hash]['ok'])) {
+                    $cachedOk = $verifyCache[$hash]['ok'];
+                    $this->enqueue($row, $site, MatchResult::matched((int)$cachedOk[0], (string)$cachedOk[1], (string)$cachedOk[2], 1));
+                    $this->statMatched++;
+                    continue;
                 }
-                $localTokens = array_flip(explode(' ', $key));
-                if (!$hasExact) {
+                $cachedNo = $verifyCache[$hash]['no'] ?? [];
+
+                // 候选查找第一遍：标题键全等 + latin第二键（本地中文名的拉丁尾部 ↔ 站内行）
+                $candidates = $index[$key] ?? [];
+                if ($passExact) {
+                    $lk = TitleNormalizer::latinKey((string)$row->torrent_name);
+                    if ('' !== $lk) {
+                        foreach ([$index[$lk] ?? [], $latinIndex[$lk] ?? []] as $extra) {
+                            foreach ($extra as $c) {
+                                $candidates[$c['torrent_id']] = $c;    // 按tid去重合并
+                            }
+                        }
+                    }
+                    $candidates = array_values($candidates);
+                    $hasExact = 0 !== count($candidates);
+                    if (!$hasExact) {
+                        continue;    // 第一遍只处理有全等候选的行
+                    }
+                } else {
+                    // 第二遍：体积桶+token（仅在开关开启时到达此处）
+                    if (preg_match('/\p{Han}/u', (string)$row->torrent_name)) {
+                        continue;    // 中文名行不进桶路径：token交集对CJK无意义且假阳性高
+                    }
+                    $candidates = [];
                     $localSize = (int)$row->torrent_size;
                     if ($localSize > 0) {
-                        // 比例容差+6MB绝对下限：页面两位小数GB舍入最高±5.4MB，纯比例对小体积种子漏杀
                         $tol = max((int)($localSize * 0.008), 6291456);
                         $lower = (int)($localSize - $tol);
                         $upper = (int)($localSize + $tol);
-                        // 二分定位第一个 >= lower 的体积键
                         $lo = 0;
                         $hi = count($sizeKeys);
                         while ($lo < $hi) {
@@ -516,42 +609,56 @@ final class LocalReseedServices
                                 $hi = $mid;
                             }
                         }
+                        $localTokens = array_flip(explode(' ', $key));
                         for ($i = $lo, $cnt = count($sizeKeys); $i < $cnt && $sizeKeys[$i] <= $upper; $i++) {
                             foreach ($bySize[$sizeKeys[$i]] as $c) {
-                                // 标题token交集过滤(60%)：防止同为S01/WEB-DL包的不同剧集撞体积
+                                // token交集：≥3个、≥短边50%、且含至少一个结构性区分词
                                 $cTokens = array_flip(explode(' ', (string)$c['title_key']));
-                                $overlap = count(array_intersect_key($localTokens, $cTokens));
-                                if ($overlap >= 3 && $overlap >= (int)ceil(min(count($localTokens), count($cTokens)) * 0.6)) {
+                                $common = array_intersect_key($localTokens, $cTokens);
+                                $overlap = count($common);
+                                if ($overlap < 3 || $overlap < (int)floor(min(count($localTokens), count($cTokens)) * 0.5)) {
+                                    continue;
+                                }
+                                $hasDistinctive = false;
+                                foreach ($common as $token => $_) {
+                                    if ($this->isDistinctiveToken((string)$token)) {
+                                        $hasDistinctive = true;
+                                        break;
+                                    }
+                                }
+                                if ($hasDistinctive) {
                                     $candidates[] = $c;
                                 }
                             }
                         }
                     }
-                }
-                if (empty($candidates)) {
-                    $this->statNoMatch++;
-                    continue;
-                }
-                $statCandidates++;
-                if (0 === $statCandidates % 50) {
-                    echo "扫描至 id={$lastId} 候选行 {$statCandidates} 已核 {$this->statNoMatch} 预算剩 {$this->budget->used($site->site)}/{$this->budget->maxRequests()} 剩余时间 " . (int)$this->budget->remainingSeconds() . "s" . PHP_EOL;
-                }
-
-                $sizeOk = array_values(array_filter($candidates, static fn($c) => TitleNormalizer::sizeClose((int)$c['size_bytes'], (int)$row->torrent_size)));
-                if (empty($sizeOk)) {
-                    if ($hasExact) {
-                        $sizeOk = $candidates;    // 标题全等信号强，页面舍入差异交给元数据字节级裁决
-                    } else {
-                        // 体积桶行：0.25%门槛都过不了 = 不同内容，不再浪费请求下载元数据
+                    if (empty($candidates)) {
                         $this->statNoMatch++;
                         continue;
                     }
                 }
+                $statCandidates++;
+                if (0 === $statCandidates % 50) {
+                    echo "扫描至 id={$lastId} 候选行 {$statCandidates} 预算 {$this->budget->used($site->site)}/{$this->budget->maxRequests()} 站点剩余 " . (int)$this->budget->remainingSeconds() . "s" . PHP_EOL;
+                }
 
-                // 免费优先
-                usort($sizeOk, static fn($a, $b) => ($b['free'] <=> $a['free']));
+                // 体积预筛(元数据校验门槛)：exact行用0.25%/12MB(2×页面舍入±5.4MB)，桶行用0.25%/6MB
+                // 不回退——体积差>门限=不同内容，下载元数据必败，纯浪费请求（曾烧掉一半预算）
+                $localSize = (int)$row->torrent_size;
+                $floor = $passExact ? 12582912 : 6291456;
+                $sizeOk = array_values(array_filter($candidates, static fn($c) => TitleNormalizer::sizeClose((int)$c['size_bytes'], $localSize, 0.0025, $floor)));
+                if (empty($sizeOk)) {
+                    $this->statNoMatch++;
+                    continue;
+                }
 
-                // 已核验不符的候选ID（避免重复下载元数据）
+                // 候选排序：|体积差|升序（最小差最可能是同发布），差值相同免费优先
+                usort($sizeOk, static function ($a, $b) use ($localSize) {
+                    $d = abs((int)$a['size_bytes'] - $localSize) <=> abs((int)$b['size_bytes'] - $localSize);
+                    return 0 !== $d ? $d : ($b['free'] <=> $a['free']);
+                });
+
+                // 已核验不符的候选ID（跨轮记忆；"待重试"的不算——瞬时失败要重试）
                 $verified = [];
                 if (preg_match('/已核:([\d,]+)/u', (string)$row->message, $mV)) {
                     $verified = array_map('intval', explode(',', $mV[1]));
@@ -561,29 +668,19 @@ final class LocalReseedServices
                 $row->candidates = count($candidates);
                 $row->search_time = time();
 
-                // 同hash已校验命中（其他客户端的同一行）：直接入队，不再下载元数据
-                $hash = (string)$row->info_hash;
-                $cachedOk = $verifyCache[$hash]['ok'] ?? null;
-                if (null !== $cachedOk) {
-                    $this->enqueue($row, $site, MatchResult::matched((int)$cachedOk[0], $hash, (string)$cachedOk[1], 1));
-                    $this->statMatched++;
-                    continue;
-                }
-                $cachedNo = $verifyCache[$hash]['no'] ?? [];
-
                 $matched = false;
                 foreach (array_slice($sizeOk, 0, $this->maxCandidates + count($verified)) as $candidate) {
                     if (in_array((int)$candidate['torrent_id'], $verified, true) || in_array((int)$candidate['torrent_id'], $cachedNo, true)) {
                         continue;
                     }
                     if (!$this->budget->allow($site->site)) {
-                        echo "校验预算耗尽(used={$this->budget->used($site->site)})，停止验证 id={$lastId}" . PHP_EOL;
-                        break;
+                        echo "校验预算耗尽(used={$this->budget->used($site->site)})，停止扫描" . PHP_EOL;
+                        break 2;
                     }
                     $this->budget->hit($site->site);
+                    $this->statVerify++;
                     try {
-                        echo "验证 id={$lastId} tid={$candidate['torrent_id']} 本地体积=" . (int)$row->torrent_size . " 页面体积=" . (int)$candidate['size_bytes'] . PHP_EOL;
-                        $result = $verifyServices->verify($candidate, (int)$row->torrent_size);
+                        $result = $verifyServices->verify($candidate, $localSize, $hash);
                     } catch (CookieInvalidException $exception) {
                         $row->message = mb_substr($exception->getMessage(), 0, 900);
                         $row->save();
@@ -597,26 +694,35 @@ final class LocalReseedServices
                     }
 
                     if (LocalReseedStatusEnums::Matched === $result->status) {
-                        $this->enqueue($row, $site, $result);
+                        $this->enqueueFamily($row, $site, $result);
+                        $verifyCache[$hash]['ok'] = [(int)$result->torrentId, $result->infoHash, (string)$result->name];
                         $matched = true;
-                        $this->statMatched++;
-                        $verifyCache[$hash]['ok'] = [(int)$result->torrentId, (string)$result->name];
                         break;
                     }
 
-                    // 核验不符：记录候选ID
-                    $verified[] = (int)$candidate['torrent_id'];
-                    $verifyCache[$hash]['no'][] = (int)$candidate['torrent_id'];
+                    if (LocalReseedStatusEnums::NoMatch === $result->status) {
+                        // 真不符（infohash/体积裁决）：跨轮记忆，兄弟行共享
+                        $verified[] = (int)$candidate['torrent_id'];
+                        $verifyCache[$hash]['no'][] = (int)$candidate['torrent_id'];
+                    }
+                    // Failed(瞬时失败)不记录——下一轮自然重试，不掩埋候选
                 }
 
                 if (!$matched) {
                     $row->status = LocalReseedStatusEnums::Pending->value;
                     $row->message = $verified ? '已核:' . implode(',', $verified) : '';
                     $row->save();
+                    if ($verified) {
+                        // 结论同步兄弟行（同hash其他客户端）：免得兄弟行重复下载同一元数据
+                        LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, [
+                            'message' => $row->message,
+                            'search_time' => time(),
+                        ]);
+                    }
                     $this->statNoMatch++;
                 }
-                if ($this->budget->timeUp()) {
-                    break;
+                if ($this->budget->timeUp() || $this->budget->siteSliceUp()) {
+                    break 2;
                 }
             }
 
@@ -625,6 +731,23 @@ final class LocalReseedServices
                 break;
             }
         }
+    }
+
+    /**
+     * token是否为结构性区分词（用于桶路径防撞车）
+     * - 必须含至少两个连续字母（排除纯数字/单字母）
+     * - 排除分辨率/位深/帧率/集数/盘符等规格token（1080p、10bit、60fps、s01e05、disc1——区分度为零）
+     * - 排除通用停用词
+     */
+    protected function isDistinctiveToken(string $token): bool
+    {
+        if (!preg_match('/[a-z]{2}/', $token)) {
+            return false;
+        }
+        if (preg_match('/^(\d{3,4}p|\d+bit|\d+fps|\d+kfps|\d+(e\d+)?|s\d+e\d+|disc\d+)$/', $token)) {
+            return false;
+        }
+        return !in_array($token, self::SEARCH_STOPWORDS, true);
     }
 
     /**
@@ -639,6 +762,32 @@ final class LocalReseedServices
                 LocalReseed::whereIn('id', $chunk)->update(['status' => LocalReseedStatusEnums::Skipped->value, 'search_time' => time()]);
             }
             $this->statSkipped += count($skipIds);
+        }
+    }
+
+    /**
+     * 命中入队 cn_reseed（复用投递管线），并把结论同步到同hash的兄弟行（各自客户端各自入队，零额外站点请求）
+     * @param LocalReseed $row
+     * @param Site $site
+     * @param MatchResult $result
+     * @return void
+     */
+    protected function enqueueFamily(LocalReseed $row, Site $site, MatchResult $result): void
+    {
+        $this->enqueue($row, $site, $result);
+        $this->statMatchedHashes++;
+
+        // 兄弟行：同hash其他客户端（master模式下入队同一目标客户端时firstOrCreate天然去重）
+        if (!$this->masterModel) {
+            $siblings = LocalReseed::where('info_hash', '=', (string)$row->info_hash)
+                ->where('target_sid', '=', $site->sid)
+                ->where('id', '<>', (int)$row->id)
+                ->where('status', '=', LocalReseedStatusEnums::Pending->value)
+                ->get();
+            foreach ($siblings as $sibling) {
+                $this->enqueue($sibling, $site, $result);
+                $this->statMatched++;
+            }
         }
     }
 
@@ -673,9 +822,10 @@ final class LocalReseedServices
         $reseedModel = Reseed::firstOrCreate($attributes, $values);
         $row->reseed_id = (int)$reseedModel->reseed_id;
         $row->status = LocalReseedStatusEnums::Matched->value;
-        $row->message = '命中：' . $result->name;
+        $row->message = '命中：' . $result->name . ($result->message ? '（' . $result->message . '）' : '');
         $row->save();
-        echo "命中 站点 {$site->site} 种子ID {$result->torrentId} 体积 {$row->torrent_size} 标题 {$result->name}" . PHP_EOL;
+        $this->statMatched++;
+        echo "命中 站点 {$site->site} 种子ID {$result->torrentId} 标题 {$result->name}" . PHP_EOL;
     }
 
     /**
@@ -811,11 +961,11 @@ final class LocalReseedServices
         $desp = '### 网站名称：' . get_system_title() . $br;
         $desp .= '**目标站点：' . implode('、', array_keys($this->targetSites)) . '**' . $br;
         $desp .= '**索引新增：' . $this->statIndexNew . '**  [本轮建库新增的站内种子数]' . $br;
-        $desp .= '**引导搜索：' . $this->statSearchGuided . '**  [IYUU已验证hash的关键词搜索次数] 补充索引 ' . $this->statSearchIngest . ' 条' . $br;
-        $desp .= '**新增进度：' . $this->statNewRows . '**  [本地新做种数]' . $br;
-        $desp .= '**命中：' . $this->statMatched . '**' . $br;
+        $desp .= '**引导搜索：' . $this->statSearchGuided . '**  [IYUU已验证hash的关键词搜索] 补充索引 ' . $this->statSearchIngest . ' 条' . $br;
+        $desp .= '**元数据校验：' . $this->statVerify . '**  [下载站内种子做infohash裁决]' . $br;
+        $desp .= '**命中唯一种子：' . $this->statMatchedHashes . '**  覆盖客户端行 ' . $this->statMatched . $br;
         $desp .= '**无匹配：' . $this->statNoMatch . '**' . $br;
-        $desp .= '**失败：' . $this->statFailed . '**' . $br;
+        $desp .= '**瞬时失败：' . $this->statFailed . '**  [下轮自动重试]' . $br;
         $desp .= '**跳过：' . $this->statSkipped . '**' . $br;
 
         $response = match ($this->notifyEnum) {
@@ -860,6 +1010,7 @@ final class LocalReseedServices
         $this->maxCandidates = max(1, min(10, $max_candidates));
         $this->indexPages = max(1, (int)($parameter['index_pages'] ?? self::DEFAULT_INDEX_PAGES));
         $this->fullIndex = (bool)($parameter['full_index'] ?? false);
+        $this->bucketMatch = (bool)($parameter['bucket_match'] ?? false);
 
         $master = $parameter['master'] ?? null;
         if ($master) {
@@ -871,8 +1022,10 @@ final class LocalReseedServices
         $max_requests = (int)($parameter['max_requests'] ?? self::DEFAULT_MAX_REQUESTS);
         $max_requests = max(1, $max_requests);
         $interval = (int)($parameter['search_interval'] ?? self::DEFAULT_INTERVAL);
-        $interval = max(0, min(60, $interval));
-        $this->budget = new SearchBudget($max_run_seconds, $max_requests, $interval);
+        $interval = max(8, min(60, $interval));    // 下限8秒：固定3秒节律是bot签名(封禁教训)
+        $daily_requests = (int)($parameter['daily_requests'] ?? self::DEFAULT_DAILY_REQUESTS);
+        $daily_requests = max(50, min(3000, $daily_requests));
+        $this->budget = new SearchBudget($max_run_seconds, $max_requests, $interval, $daily_requests);
 
         $this->crontabModel = $crontabModel;
         $this->crontabSites = $sites;

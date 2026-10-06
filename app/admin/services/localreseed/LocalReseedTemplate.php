@@ -136,9 +136,9 @@ class LocalReseedTemplate extends CrontabAbstract
 <div class="layui-form-item">
     <label class="layui-form-label">请求间隔</label>
     <div class="layui-input-inline layui-input-wrap">
-        <input type="number" name="parameter[search_interval]" value="5" min="0" max="60" lay-verify="number" class="layui-input">
+        <input type="number" name="parameter[search_interval]" value="10" min="8" max="60" lay-verify="number" class="layui-input">
     </div>
-    <div class="layui-form-mid layui-text-em">对站点的相邻请求最小间隔(秒)，自动抬升至站点限速配置</div>
+    <div class="layui-form-mid layui-text-em">对站点的相邻请求最小间隔(秒,下限8并带±40%抖动)，自动抬升至站点限速配置</div>
 </div>
 <div class="layui-form-item">
     <label class="layui-form-label">每站请求上限</label>
@@ -146,6 +146,21 @@ class LocalReseedTemplate extends CrontabAbstract
         <input type="number" name="parameter[max_requests]" value="100" min="1" class="layui-input">
     </div>
     <div class="layui-form-mid layui-text-em">每站每轮最大请求数(建库翻页+元数据合计)，剩余下一轮续跑</div>
+</div>
+<div class="layui-form-item">
+    <label class="layui-form-label">每站每日上限</label>
+    <div class="layui-input-inline layui-input-wrap">
+        <input type="number" name="parameter[daily_requests]" value="800" min="50" max="3000" lay-verify="number" class="layui-input">
+    </div>
+    <div class="layui-form-mid layui-text-em">每站每日请求硬上限(全局台账强制,含失败;凌晨0-9点窗口外自动暂停)</div>
+</div>
+<div class="layui-form-item">
+    <label class="layui-form-label" title="体积±0.8%+token交集的第二匹配通道">体积桶匹配</label>
+    <div class="layui-input-block">
+        <input type="radio" name="parameter[bucket_match]" value="0" title="关闭(推荐)" checked>
+        <input type="radio" name="parameter[bucket_match]" value="1" title="开启">
+    </div>
+    <div class="layui-form-mid layui-text-em">假阳性/请求比标题全等差2-3个数量级，仅无中文名的种子启用；默认关闭</div>
 </div>
 <div class="layui-form-item">
     <label class="layui-form-label">单轮时间</label>

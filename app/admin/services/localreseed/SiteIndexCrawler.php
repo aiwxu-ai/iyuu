@@ -22,7 +22,12 @@ final class SiteIndexCrawler
     /**
      * 已知比例阈值：非置顶种子中已索引占比超过此值时，增量模式停止
      */
-    private const float KNOWN_RATIO_STOP = 0.9;
+    private const float KNOWN_RATIO_STOP = 0.6;
+
+    /**
+     * 空页三振：连续异常空页达到此值才置full_done（限流页/模板变化不再永久冻结索引）
+     */
+    private const int FULL_DONE_EMPTY_STREAK = 3;
 
     /**
      * @param Site $site 目标站点
@@ -55,19 +60,29 @@ final class SiteIndexCrawler
         $pages = 0;
         $newRows = 0;
         $fullDone = false;
+        $emptyStreak = 0;
         while ($pages < $maxPages && $this->budget->allow($this->site->site)) {
-            $html = $this->fetchPage($page);
+            // 先记账再请求：失败的请求同样计入预算与台账
             $this->budget->hit($this->site->site);
+            $html = $this->fetchPage($page);
             $pages++;
 
             $rows = $this->parse($html);
             if (empty($rows)) {
-                // 空页：全库模式标记完成
-                if ($fullMode) {
+                // 空页三振判定：页面含种子表特征但解析0行=解析异常(不置完成)；连续真空页才到底
+                $pageHasTable = str_contains($html, 'torrentname') || str_contains($html, 'details.php?id=');
+                if ($pageHasTable) {
+                    $emptyStreak = 0;    // 解析异常，不当到底
+                } elseif (++$emptyStreak >= self::FULL_DONE_EMPTY_STREAK && $fullMode) {
                     $fullDone = true;
                 }
-                break;
+                if ($fullDone || $emptyStreak >= self::FULL_DONE_EMPTY_STREAK) {
+                    break;
+                }
+                $page++;
+                continue;
             }
+            $emptyStreak = 0;
 
             // 分页器最大页码：已到尾页则全库完成（NexusPHP超尾页会钳制回最后一页，不能靠空页判断）
             if ($fullMode && preg_match_all('/[?&]page=(\d+)/', $html, $mPages)) {
@@ -87,7 +102,7 @@ final class SiteIndexCrawler
                 $nonSticky = array_filter($rows, static fn($r) => 0 === (int)$r['sticky']);
                 $nonStickyCount = count($nonSticky) ?: count($rows);
                 $knownCount = count($nonSticky) - $inserted;
-                if ($nonStickyCount > 0 && ($knownCount / $nonStickyCount) >= self::KNOWN_RATIO_STOP && $page >= 2) {
+                if ($nonStickyCount > 0 && ($knownCount / $nonStickyCount) >= self::KNOWN_RATIO_STOP) {
                     break;
                 }
             }
@@ -280,7 +295,7 @@ final class SiteIndexCrawler
     }
 
     /**
-     * 批量入库(幂等)
+     * 批量入库(幂等)：insertOrIgnore保新增计数(供增量比例判断)，upsert刷新free/size等随时间变化的字段
      * @param array $rows
      * @return int 新增行数
      */
@@ -307,6 +322,7 @@ final class SiteIndexCrawler
         $inserted = 0;
         foreach (array_chunk($data, 200) as $chunk) {
             $inserted += SiteTorrent::insertOrIgnore($chunk);
+            SiteTorrent::upsert($chunk, ['sid', 'torrent_id'], ['title', 'title_key', 'size_bytes', 'free', 'sticky', 'download_uri', 'updated_at']);
         }
         return $inserted;
     }

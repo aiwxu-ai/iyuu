@@ -31,6 +31,25 @@ final class TitleNormalizer
     }
 
     /**
+     * 拉丁第二匹配键：剥离前导连续CJK段后的剩余部分
+     * - 场景："中文.English.Name.2017..." 无括号中文前缀名 与 站内纯英文名 的title_key永不相等
+     * - latinKey相等时视为标题全等级候选（零请求的第二exact通道）
+     * @param string $title
+     * @return string 剥离后为空(纯中文名)返回''
+     */
+    public static function latinKey(string $title): string
+    {
+        $key = self::key($title);
+        if ('' === $key) {
+            return '';
+        }
+        // 剥离前导CJK字符/中文标点段
+        $latin = preg_replace('/^[\p{Han}：、·！？，。“”‘’《》〈〉（）\s]+/u', '', $key) ?? $key;
+        $latin = trim($latin, ' .-_');
+        return ($latin === $key || '' === $latin) ? '' : $latin;
+    }
+
+    /**
      * 体积预筛(元数据校验门槛)：比例容差 + 绝对下限
      * 真同种(同infohash跨站)页面体积差通常<0.1%；不同影片常撞进0.2%~1%区间
      * → 校验门槛取 max(0.25%, 6MB)：真阳性必过，假阳性大多死于本地判断（零请求）

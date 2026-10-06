@@ -37,11 +37,12 @@ final readonly class MatchResult
      * @param string $infoHash
      * @param string $name
      * @param int $candidates
+     * @param string $message 附加说明（如size-only标注）
      * @return self
      */
-    public static function matched(int $torrentId, string $infoHash, string $name, int $candidates): self
+    public static function matched(int $torrentId, string $infoHash, string $name, int $candidates, string $message = ''): self
     {
-        return new self(LocalReseedStatusEnums::Matched, $candidates, $torrentId, $infoHash, $name);
+        return new self(LocalReseedStatusEnums::Matched, $candidates, $torrentId, $infoHash, $name, $message);
     }
 
     /**

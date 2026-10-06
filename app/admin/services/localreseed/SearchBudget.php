@@ -2,19 +2,43 @@
 
 namespace app\admin\services\localreseed;
 
+use app\admin\support\NotifyAdmin;
+use app\model\SiteRequestLedger;
+
 /**
- * 搜索预算控制器
- * - 时间预算：单轮最长运行秒数（必须小于计划任务硬超时1200秒）
- * - 请求预算：每站点每轮最大请求数（搜索+元数据下载合计）
- * - 请求间隔：相邻请求最小间隔秒数（自动抬升至站点限速配置）
+ * 搜索预算控制器（进程内预算 + 跨进程全局台账）
+ *
+ * 进程内：时间预算(单轮最长运行秒数)、每站每轮请求上限、站点时间分片
+ * 跨进程：cn_site_request_ledger 台账——每站每日请求硬上限、最小间隔(带抖动)、
+ *         活跃窗口(默认09:00-23:00)、连续失败熔断(3次→冷却24小时)
+ *
+ * 封禁教训：多进程并发各记各的账 = 封号。所有对站请求必须经过本类的 allow/hit。
  */
 final class SearchBudget
 {
     /**
-     * 每站请求计数
+     * 每站请求计数(本进程本轮)
      * @var array<string, int>
      */
     private array $perSite = [];
+
+    /**
+     * 每站最近一次请求时刻(进程内, microtime)
+     * @var array<string, float>
+     */
+    private array $lastHitAt = [];
+
+    /**
+     * 台账行缓存 site => SiteRequestLedger
+     * @var array<string, SiteRequestLedger>
+     */
+    private array $ledgerCache = [];
+
+    /**
+     * 熔断/窗口外 已提示过的站点(每轮每站只提示一次)
+     * @var array<string, bool>
+     */
+    private array $notifiedOnce = [];
 
     /**
      * 起始时间戳(微秒)
@@ -22,29 +46,34 @@ final class SearchBudget
     private readonly float $startTime;
 
     /**
+     * 当前站点的截止时刻(微秒, 时间分片)
+     */
+    private float $siteDeadline = PHP_FLOAT_MAX;
+
+    /**
      * 相邻请求最小间隔(秒)，可被站点限速配置抬升
-     * @var int
      */
     private int $interval;
 
     /**
-     * @param int $maxRunSeconds 单轮时间预算(秒)
+     * @param int $maxRunSeconds 单轮时间预算(秒) 必须小于计划任务硬超时1200秒
      * @param int $maxRequests 每站每轮最大请求数
      * @param int $interval 相邻请求最小间隔(秒)
+     * @param int $dailyRequests 每站每日请求硬上限(台账强制, 含失败请求)
      */
     public function __construct(
         private readonly int $maxRunSeconds,
         private readonly int $maxRequests,
-        int $interval
+        int $interval,
+        private readonly int $dailyRequests = 800
     )
     {
-        $this->interval = $interval;
+        $this->interval = max($interval, 8);    // 下限8秒：3秒级固定节律是bot签名
         $this->startTime = microtime(true);
     }
 
     /**
      * 单轮时间是否已耗尽
-     * @return bool
      */
     public function timeUp(): bool
     {
@@ -52,36 +81,85 @@ final class SearchBudget
     }
 
     /**
-     * 站点是否还允许发起请求
-     * @param string $site
-     * @return bool
+     * 当前站点时间片是否已耗尽
      */
-    public function allow(string $site): bool
+    public function siteSliceUp(): bool
     {
-        if ($this->timeUp()) {
-            return false;
-        }
-
-        return ($this->perSite[$site] ?? 0) < $this->maxRequests;
+        return microtime(true) >= $this->siteDeadline;
     }
 
     /**
-     * 记录一次请求并休眠
-     * @param string $site
-     * @return void
+     * 站点是否还允许发起请求
+     * 检查链：时间片→轮时间→轮请求上限→台账(熔断/日限/跨进程间隔/活跃窗口)
+     */
+    public function allow(string $site): bool
+    {
+        if ($this->timeUp() || $this->siteSliceUp()) {
+            return false;
+        }
+        if (($this->perSite[$site] ?? 0) >= $this->maxRequests) {
+            return false;
+        }
+
+        $ledger = $this->ledger($site);
+        if ($ledger->inCooldown()) {
+            $this->warnOnce($site, '站点熔断中至 ' . date('H:i', (int)$ledger->cooldown_until) . '：' . $site . '（连续失败触发24小时冷却）');
+            return false;
+        }
+        if ($ledger->todayRequests() >= $this->dailyRequests) {
+            $this->warnOnce($site, "站点日限已满：{$site} 今日 {$ledger->todayRequests()}/{$this->dailyRequests} 请求，明日自动恢复");
+            return false;
+        }
+        if (!self::inActiveWindow()) {
+            $this->warnOnce($site, '活跃窗口外(默认09:00-23:00)暂停站点请求：' . $site);
+            return false;
+        }
+        // 跨进程最小间隔：距台账最近一次请求不足间隔(含抖动余量)则暂缓
+        $elapsed = time() - (int)$ledger->last_ts;
+        if ((int)$ledger->last_ts > 0 && $elapsed < $this->interval) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 记录一次请求并休眠到间隔满足
+     * 顺序：先记账(即使后续请求失败也计费) → 按进程内最近请求时刻补足间隔
      */
     public function hit(string $site): void
     {
+        SiteRequestLedger::charge($site);
+        unset($this->ledgerCache[$site]);    // 缓存失效，下次allow重新读
         $this->perSite[$site] = ($this->perSite[$site] ?? 0) + 1;
-        if (0 < $this->interval) {
-            sleep($this->interval);
+
+        $interval = $this->jitteredInterval();
+        $last = $this->lastHitAt[$site] ?? 0.0;
+        $wait = $interval - (microtime(true) - $last);
+        if ($wait > 0) {
+            usleep((int)($wait * 1000000));
         }
+        $this->lastHitAt[$site] = microtime(true);
+    }
+
+    /**
+     * 带抖动的间隔(±40%)：固定节律是爬虫签名
+     */
+    private function jitteredInterval(): float
+    {
+        return $this->interval * mt_rand(60, 140) / 100;
+    }
+
+    /**
+     * 活跃窗口（凌晨全静默；夜间匀速抓取是典型爬虫特征）
+     */
+    public static function inActiveWindow(): bool
+    {
+        $hour = (int)date('G');
+        return $hour >= 9 && $hour < 23;
     }
 
     /**
      * 抬升请求间隔（不低于站点限速配置）
-     * @param int $seconds
-     * @return void
      */
     public function intervalAtLeast(int $seconds): void
     {
@@ -91,18 +169,7 @@ final class SearchBudget
     }
 
     /**
-     * 站点已用请求数
-     * @param string $site
-     * @return int
-     */
-    public function used(string $site): int
-    {
-        return $this->perSite[$site] ?? 0;
-    }
-
-    /**
      * 时间预算剩余秒数
-     * @return float
      */
     public function remainingSeconds(): float
     {
@@ -110,11 +177,47 @@ final class SearchBudget
     }
 
     /**
+     * 设置当前站点的时间片截止(秒后)
+     */
+    public function setSiteDeadline(float $seconds): void
+    {
+        $this->siteDeadline = microtime(true) + $seconds;
+    }
+
+    /**
      * 每站请求上限
-     * @return int
      */
     public function maxRequests(): int
     {
         return $this->maxRequests;
+    }
+
+    /**
+     * 站点已用请求数(本进程本轮)
+     */
+    public function used(string $site): int
+    {
+        return $this->perSite[$site] ?? 0;
+    }
+
+    /**
+     * 台账行(带缓存)
+     */
+    private function ledger(string $site): SiteRequestLedger
+    {
+        return $this->ledgerCache[$site] ??= SiteRequestLedger::getOrNew($site);
+    }
+
+    /**
+     * 每轮每站只提示一次
+     */
+    private function warnOnce(string $site, string $message): void
+    {
+        if (isset($this->notifiedOnce[$site])) {
+            return;
+        }
+        $this->notifiedOnce[$site] = true;
+        echo $message . PHP_EOL;
+        NotifyAdmin::warning($message);
     }
 }
