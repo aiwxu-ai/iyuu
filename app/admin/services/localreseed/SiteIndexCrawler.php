@@ -132,6 +132,42 @@ final class SiteIndexCrawler
     }
 
     /**
+     * 站内关键词搜索（单token短语在NexusPHP下是整串模糊匹配，必须拆词）
+     * @param string $term 搜索词（只传一个特征词）
+     * @param int $page 页码
+     * @return array<int, array{torrent_id:int,title:string,title_key:string,size_bytes:int,free:int,sticky:int,download_uri:string}>
+     * @throws CookieInvalidException
+     */
+    public function search(string $term, int $page = 0): array
+    {
+        $curl = new Curl();
+        $this->applyCurlOptions($curl);
+        $curl->get($this->domain() . '/torrents.php?incldead=' . $this->incldead . '&search=' . rawurlencode($term) . '&page=' . $page);
+        if (!$curl->isSuccess() || empty($curl->response)) {
+            throw new RuntimeException('搜索请求失败 term=' . $term . ' http=' . $curl->http_status_code);
+        }
+
+        $html = (string)$curl->response;
+        if (str_contains($html, 'Just a moment') || str_contains($html, 'cf-challenge')) {
+            throw new CookieInvalidException('站点触发Cloudflare挑战：' . $this->site->site . '（cookie含cf_clearance可能过期）');
+        }
+        if (!str_contains($html, 'torrentname') && str_contains($html, 'login.php')) {
+            throw new CookieInvalidException('站点cookie已失效：' . $this->site->site);
+        }
+        return $this->parse($html);
+    }
+
+    /**
+     * 外部行数据入库(幂等)，供搜索结果补充索引
+     * @param array $rows
+     * @return int 新增行数
+     */
+    public function ingest(array $rows): int
+    {
+        return $rows ? $this->upsert($rows) : 0;
+    }
+
+    /**
      * 解析列表页
      * @param string $html
      * @return array<int, array{torrent_id:int,title:string,title_key:string,size_bytes:int,free:int,sticky:int,download_uri:string}>

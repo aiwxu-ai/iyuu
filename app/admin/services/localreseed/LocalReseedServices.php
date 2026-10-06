@@ -54,6 +54,14 @@ final class LocalReseedServices
      * 每轮建库默认翻页数
      */
     public const int DEFAULT_INDEX_PAGES = 100;
+    /**
+     * 关键词引导搜索的重搜间隔(秒)：12小时内搜过的行不再搜
+     */
+    public const int SEARCH_GUIDED_REQUEUE_SECONDS = 43200;
+    /**
+     * 搜索词排除的通用词（无区分度）
+     */
+    protected const array SEARCH_STOPWORDS = ['the', 'and', 'for', 'with', 'from', 'into', 'season', 'complete', 'multi', 'audio', 'dual', 'proper', 'repack', 'extended', 'remastered', 'internal', 'limited', 'unrated', 'runtime', 'subbed', 'chinese', 'english', 'jun', 'part'];
 
     /**
      * 计划任务：数据模型
@@ -124,6 +132,8 @@ final class LocalReseedServices
      */
     protected int $statNewRows = 0;
     protected int $statIndexNew = 0;
+    protected int $statSearchGuided = 0;
+    protected int $statSearchIngest = 0;
     protected int $statMatched = 0;
     protected int $statNoMatch = 0;
     protected int $statFailed = 0;
@@ -175,6 +185,8 @@ final class LocalReseedServices
         foreach ($this->targetSites as $site) {
             // 阶段A 建库
             $this->buildIndex($site);
+            // 阶段A2 关键词引导补充索引（IYUU跨站已验证hash优先）
+            $this->searchGuided($site);
             // 阶段B 本地匹配
             $this->matchLocal($clientIds, $site);
             if ($this->budget->timeUp()) {
@@ -218,6 +230,118 @@ final class LocalReseedServices
             echo "站点 {$site->nickname} 建库异常：" . $throwable->getMessage() . PHP_EOL;
             NotifyAdmin::warning("站点 {$site->site} 建库异常：" . mb_substr($throwable->getMessage(), 0, 300));
         }
+    }
+
+    /**
+     * 阶段A2：关键词引导补充索引
+     * - IYUU官方辅种成功的hash（cn_reseed记录）= 已确认在其他站存在 → 大概率目标站也有
+     * - 对这批本地种子用特征词做站内单token搜索，结果入库索引，供阶段B本地匹配
+     * - NexusPHP的search是整串模糊匹配，多词短语必然零结果，故只取一个最具区分度的词
+     * @param Site $site
+     * @return void
+     */
+    protected function searchGuided(Site $site): void
+    {
+        // 站点限速配置抬升间隔
+        try {
+            $limit = (new \Iyuu\SiteManager\Config($site->toArray()))->getLimit();
+            $this->budget->intervalAtLeast((int)($limit['sleep'] ?? 0));
+        } catch (Throwable) {
+        }
+
+        try {
+            $crawler = new SiteIndexCrawler($site, $this->budget, $this->incldead);
+        } catch (Throwable $throwable) {
+            echo "站点 {$site->nickname} 创建爬虫失败：" . $throwable->getMessage() . PHP_EOL;
+            return;
+        }
+
+        $minTs = time() - self::SEARCH_GUIDED_REQUEUE_SECONDS;
+        $lastId = 0;
+        $searched = 0;
+        $ingested = 0;
+        while (!$this->budget->timeUp() && $this->budget->allow($site->site)) {
+            /** @var LocalReseed[] $rows 只处理IYUU已跨站验证过的hash */
+            $rows = LocalReseed::where('target_sid', '=', $site->sid)
+                ->where('status', '=', LocalReseedStatusEnums::Pending->value)
+                ->where('torrent_size', '>', 0)
+                ->where('search_time', '<', $minTs)
+                ->whereRaw("EXISTS (SELECT 1 FROM cn_reseed r WHERE r.info_hash = cn_local_reseed.info_hash AND r.info_hash <> '')")
+                ->where('id', '>', $lastId)
+                ->orderBy('id')
+                ->limit(50)
+                ->get();
+            if ($rows->isEmpty()) {
+                break;
+            }
+
+            foreach ($rows as $row) {
+                $lastId = (int)$row->id;
+                if ($this->budget->timeUp() || !$this->budget->allow($site->site)) {
+                    break 2;
+                }
+
+                $token = $this->pickSearchToken((string)$row->torrent_name);
+                if ('' === $token) {
+                    continue;
+                }
+
+                $this->budget->hit($site->site);
+                try {
+                    $resultRows = $crawler->search($token);
+                } catch (CookieInvalidException $exception) {
+                    echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
+                    NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
+                    return;
+                } catch (Throwable $throwable) {
+                    continue;
+                }
+                $searched++;
+
+                // 搜索结果全部入库（索引增量，阶段B统一匹配）
+                $ingested += $crawler->ingest($resultRows);
+                $row->keyword = mb_substr($token, 0, 190);
+                $row->search_time = time();
+                $row->save();
+            }
+        }
+
+        if ($searched > 0) {
+            $this->statSearchGuided += $searched;
+            $this->statSearchIngest += $ingested;
+            echo "站点 {$site->nickname} 关键词引导：搜索 {$searched} 次 补充索引 {$ingested} 条" . PHP_EOL;
+        }
+    }
+
+    /**
+     * 从本地种子名提取最具区分度的搜索词（纯ascii、非通用词、优先标题词）
+     * @param string $name
+     * @return string
+     */
+    protected function pickSearchToken(string $name): string
+    {
+        $key = TitleNormalizer::key($name);
+        if ('' === $key) {
+            return '';
+        }
+
+        $best = '';
+        $bestScore = 0;
+        foreach (explode(' ', $key) as $i => $token) {
+            if (!preg_match('/^[a-z][a-z0-9\']{3,}$/', $token)) {
+                continue;    // 跳过中文、纯数字、短词
+            }
+            if (in_array($token, self::SEARCH_STOPWORDS, true)) {
+                continue;
+            }
+            // 标题词在前（分辨率/编码词之前），靠前加分
+            $score = min(strlen($token), 12) - ($i > 10 ? 3 : 0);
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $best = $token;
+            }
+        }
+        return $best;
     }
 
     /**
@@ -325,7 +449,7 @@ final class LocalReseedServices
 
                 $sizeOk = array_values(array_filter($candidates, static fn($c) => TitleNormalizer::sizeClose((int)$c['size_bytes'], (int)$row->torrent_size)));
                 if (empty($sizeOk)) {
-                    $sizeOk = $candidates;    // 体积桶路径已预筛过，标题路径候选不再卡体积
+                    $sizeOk = $candidates;    // 页面体积两位小数舍入，小体积种子误差可达±5%，留给元数据字节级裁决
                 }
 
                 // 免费优先
@@ -577,6 +701,7 @@ final class LocalReseedServices
         $desp = '### 网站名称：' . get_system_title() . $br;
         $desp .= '**目标站点：' . implode('、', array_keys($this->targetSites)) . '**' . $br;
         $desp .= '**索引新增：' . $this->statIndexNew . '**  [本轮建库新增的站内种子数]' . $br;
+        $desp .= '**引导搜索：' . $this->statSearchGuided . '**  [IYUU已验证hash的关键词搜索次数] 补充索引 ' . $this->statSearchIngest . ' 条' . $br;
         $desp .= '**新增进度：' . $this->statNewRows . '**  [本地新做种数]' . $br;
         $desp .= '**命中：' . $this->statMatched . '**' . $br;
         $desp .= '**无匹配：' . $this->statNoMatch . '**' . $br;
