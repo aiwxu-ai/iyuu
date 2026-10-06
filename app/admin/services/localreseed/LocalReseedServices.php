@@ -61,7 +61,9 @@ final class LocalReseedServices
     /**
      * 搜索词排除的通用词（无区分度）
      */
-    protected const array SEARCH_STOPWORDS = ['the', 'and', 'for', 'with', 'from', 'into', 'season', 'complete', 'multi', 'audio', 'dual', 'proper', 'repack', 'extended', 'remastered', 'internal', 'limited', 'unrated', 'runtime', 'subbed', 'chinese', 'english', 'jun', 'part'];
+    protected const array SEARCH_STOPWORDS = ['the', 'and', 'for', 'with', 'from', 'into', 'season', 'complete', 'multi', 'audio', 'dual', 'proper', 'repack', 'extended', 'remastered', 'internal', 'limited', 'unrated', 'runtime', 'subbed', 'chinese', 'english', 'jun', 'part',
+        'bluray', 'blu', 'ray', 'uhd', 'hdr', 'dolby', 'vision', 'remux', 'flac', 'ddp', 'dts', 'ac3', 'ma', 'hevc', 'x264', 'x265', 'h264', 'h265', 'avc', 'web', 'webdl', 'hdtv', 'atmos', 'imax', 'hack', 'hackui', 'iuvc', 'hq', 'tenbit', 'ddp5',
+        'movie', 'movies', 'film', 'films', 'series', 'show', 'ep', 'episode', 'episodes', 'vivid', 'hybrid', 'nv', '出品', '中字', '国语', '粤语', '双语'];
 
     /**
      * 计划任务：数据模型
@@ -233,10 +235,11 @@ final class LocalReseedServices
     }
 
     /**
-     * 阶段A2：关键词引导补充索引
+     * 阶段A2：关键词引导搜索（IYUU-hash优先，直接匹配）
      * - IYUU官方辅种成功的hash（cn_reseed记录）= 已确认在其他站存在 → 大概率目标站也有
-     * - 对这批本地种子用特征词做站内单token搜索，结果入库索引，供阶段B本地匹配
+     * - 对这批本地种子用特征词做站内单token搜索：结果入库索引 + 体积吻合候选当场元数据校验入队
      * - NexusPHP的search是整串模糊匹配，多词短语必然零结果，故只取一个最具区分度的词
+     * - 校验在本阶段内完成（搜索结果就是为本行服务的），不依赖阶段B的剩余预算
      * @param Site $site
      * @return void
      */
@@ -251,6 +254,7 @@ final class LocalReseedServices
 
         try {
             $crawler = new SiteIndexCrawler($site, $this->budget, $this->incldead);
+            $verifyServices = new SiteSearchServices($site);
         } catch (Throwable $throwable) {
             echo "站点 {$site->nickname} 创建爬虫失败：" . $throwable->getMessage() . PHP_EOL;
             return;
@@ -260,6 +264,7 @@ final class LocalReseedServices
         $lastId = 0;
         $searched = 0;
         $ingested = 0;
+        $firstError = '';
         while (!$this->budget->timeUp() && $this->budget->allow($site->site)) {
             /** @var LocalReseed[] $rows 只处理IYUU已跨站验证过的hash */
             $rows = LocalReseed::where('target_sid', '=', $site->sid)
@@ -272,6 +277,9 @@ final class LocalReseedServices
                 ->limit(50)
                 ->get();
             if ($rows->isEmpty()) {
+                if (0 === $searched) {
+                    echo "站点 {$site->nickname} 引导搜索：无可搜索行（已搜空或12小时内已搜）" . PHP_EOL;
+                }
                 break;
             }
 
@@ -294,22 +302,62 @@ final class LocalReseedServices
                     NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
                     return;
                 } catch (Throwable $throwable) {
+                    if ('' === $firstError) {
+                        $firstError = get_class($throwable) . ': ' . $throwable->getMessage();
+                    }
                     continue;
                 }
                 $searched++;
 
-                // 搜索结果全部入库（索引增量，阶段B统一匹配）
+                // 搜索结果全部入库（索引增量，供阶段B本地匹配复用）
                 $ingested += $crawler->ingest($resultRows);
                 $row->keyword = mb_substr($token, 0, 190);
+                $row->candidates = count($resultRows);
                 $row->search_time = time();
-                $row->save();
+
+                // 体积吻合候选：当场下载元数据做字节级裁决（免费优先）
+                $localSize = (int)$row->torrent_size;
+                $cands = array_values(array_filter($resultRows, static fn($c) => (int)$c['size_bytes'] > 0 && TitleNormalizer::sizeClose((int)$c['size_bytes'], $localSize)));
+                if (!empty($cands)) {
+                    usort($cands, static fn($a, $b) => ($b['free'] <=> $a['free']));
+                }
+                foreach (array_slice($cands, 0, 2) as $cand) {
+                    if (!$this->budget->allow($site->site)) {
+                        break;
+                    }
+                    $this->budget->hit($site->site);
+                    try {
+                        $result = $verifyServices->verify($cand, $localSize);
+                    } catch (CookieInvalidException $exception) {
+                        $row->message = mb_substr($exception->getMessage(), 0, 900);
+                        $row->save();
+                        echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
+                        NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
+                        return;
+                    } catch (Throwable $throwable) {
+                        continue;
+                    }
+
+                    if (LocalReseedStatusEnums::Matched === $result->status) {
+                        $this->enqueue($row, $site, $result);
+                        $this->statMatched++;
+                        break;
+                    }
+                }
+
+                if (LocalReseedStatusEnums::Matched->value !== (int)$row->status) {
+                    $row->save();
+                }
             }
         }
 
         if ($searched > 0) {
             $this->statSearchGuided += $searched;
             $this->statSearchIngest += $ingested;
-            echo "站点 {$site->nickname} 关键词引导：搜索 {$searched} 次 补充索引 {$ingested} 条" . PHP_EOL;
+            echo "站点 {$site->nickname} 关键词引导：搜索 {$searched} 次 补充索引 {$ingested} 条 命中 {$this->statMatched}" . ($firstError ? ' 首个异常：' . mb_substr($firstError, 0, 200) : '') . PHP_EOL;
+        } elseif ('' !== $firstError) {
+            echo "站点 {$site->nickname} 引导搜索全部异常，首个：" . mb_substr($firstError, 0, 300) . PHP_EOL;
+            NotifyAdmin::warning("站点 {$site->site} 引导搜索全部异常：" . mb_substr($firstError, 0, 300));
         }
     }
 
@@ -326,7 +374,7 @@ final class LocalReseedServices
         }
 
         $best = '';
-        $bestScore = 0;
+        $bestScore = -1;
         foreach (explode(' ', $key) as $i => $token) {
             if (!preg_match('/^[a-z][a-z0-9\']{3,}$/', $token)) {
                 continue;    // 跳过中文、纯数字、短词
@@ -334,8 +382,8 @@ final class LocalReseedServices
             if (in_array($token, self::SEARCH_STOPWORDS, true)) {
                 continue;
             }
-            // 标题词在前（分辨率/编码词之前），靠前加分
-            $score = min(strlen($token), 12) - ($i > 10 ? 3 : 0);
+            // 标题词在前（分辨率/编码词之前）：长度×2再减位次，保证 salon(kitty) 赢 bluray
+            $score = min(strlen($token), 10) * 2 - $i;
             if ($score > $bestScore) {
                 $bestScore = $score;
                 $best = $token;
