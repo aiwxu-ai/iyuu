@@ -239,6 +239,7 @@ final class LocalReseedServices
                     $index[$row->title_key][] = [
                         'torrent_id' => (int)$row->torrent_id,
                         'title' => (string)$row->title,
+                        'title_key' => (string)$row->title_key,
                         'size_bytes' => (int)$row->size_bytes,
                         'free' => (int)$row->free,
                         'download_uri' => (string)$row->download_uri,
@@ -249,6 +250,18 @@ final class LocalReseedServices
             echo "站点 {$site->nickname} 索引为空，跳过匹配" . PHP_EOL;
             return;
         }
+
+        // 构建体积桶索引：size_bytes => 候选行列表（页面精度舍入后聚合）
+        $bySize = [];
+        foreach ($index as $rows0) {
+            foreach ($rows0 as $c) {
+                if ((int)$c['size_bytes'] > 0) {
+                    $bySize[(int)$c['size_bytes']][] = $c;
+                }
+            }
+        }
+        ksort($bySize);
+        $sizeKeys = array_keys($bySize);
 
         $verifyServices = new SiteSearchServices($site);
         $lastId = 0;
@@ -274,17 +287,45 @@ final class LocalReseedServices
                     continue;
                 }
 
+                // 候选查找：标题键完全相等（快速路径）+ 体积区间（页面舍入容差）
                 $candidates = $index[$key] ?? [];
+                $localTokens = array_flip(explode(' ', $key));
+                if (0 === count($candidates)) {
+                    $localSize = (int)$row->torrent_size;
+                    if ($localSize > 0) {
+                        $lower = (int)floor($localSize * 0.995);
+                        $upper = (int)ceil($localSize * 1.005);
+                        // 二分定位第一个 >= lower 的体积键
+                        $lo = 0;
+                        $hi = count($sizeKeys);
+                        while ($lo < $hi) {
+                            $mid = ($lo + $hi) >> 1;
+                            if ($sizeKeys[$mid] < $lower) {
+                                $lo = $mid + 1;
+                            } else {
+                                $hi = $mid;
+                            }
+                        }
+                        for ($i = $lo, $cnt = count($sizeKeys); $i < $cnt && $sizeKeys[$i] <= $upper; $i++) {
+                            foreach ($bySize[$sizeKeys[$i]] as $c) {
+                                // 标题token交集过滤，防止大体积撞车
+                                $cTokens = array_flip(explode(' ', (string)$c['title_key']));
+                                $overlap = count(array_intersect_key($localTokens, $cTokens));
+                                if ($overlap >= 3 && $overlap >= (int)floor(min(count($localTokens), count($cTokens)) * 0.5)) {
+                                    $candidates[] = $c;
+                                }
+                            }
+                        }
+                    }
+                }
                 if (empty($candidates)) {
                     $this->statNoMatch++;
                     continue;
                 }
 
-                // 体积预筛（页面精度容差1%）
                 $sizeOk = array_values(array_filter($candidates, static fn($c) => TitleNormalizer::sizeClose((int)$c['size_bytes'], (int)$row->torrent_size)));
                 if (empty($sizeOk)) {
-                    $this->statNoMatch++;
-                    continue;
+                    $sizeOk = $candidates;    // 体积桶路径已预筛过，标题路径候选不再卡体积
                 }
 
                 // 免费优先

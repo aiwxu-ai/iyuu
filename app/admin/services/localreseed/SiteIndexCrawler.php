@@ -69,6 +69,16 @@ final class SiteIndexCrawler
                 break;
             }
 
+            // 分页器最大页码：已到尾页则全库完成（NexusPHP超尾页会钳制回最后一页，不能靠空页判断）
+            if ($fullMode && preg_match_all('/[?&]page=(\d+)/', $html, $mPages)) {
+                $maxPage = (int)max($mPages[1]);
+                if ($page >= $maxPage) {
+                    $newRows += $this->upsert($rows);
+                    $fullDone = true;
+                    break;
+                }
+            }
+
             $inserted = $this->upsert($rows);
             $newRows += $inserted;
 
