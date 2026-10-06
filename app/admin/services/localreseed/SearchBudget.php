@@ -99,4 +99,22 @@ final class SearchBudget
     {
         return $this->perSite[$site] ?? 0;
     }
+
+    /**
+     * 时间预算剩余秒数
+     * @return float
+     */
+    public function remainingSeconds(): float
+    {
+        return max(0, $this->maxRunSeconds - (microtime(true) - $this->startTime));
+    }
+
+    /**
+     * 每站请求上限
+     * @return int
+     */
+    public function maxRequests(): int
+    {
+        return $this->maxRequests;
+    }
 }
