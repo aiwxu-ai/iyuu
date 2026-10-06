@@ -89,10 +89,17 @@ update_render_callable.push(
                                 });
                             }
 
-                            // 渲染搜索范围
+                            // 渲染索引范围
                             if (parameter['incldead'] !== undefined) {
                                 $('input[name="parameter[incldead]').each(function () {
                                     $(this).prop('checked', $(this).val() === String(parameter['incldead']));
+                                });
+                            }
+
+                            // 渲染建库模式
+                            if (parameter['full_index'] !== undefined) {
+                                $('input[name="parameter[full_index]').each(function () {
+                                    $(this).prop('checked', $(this).val() === String(parameter['full_index']));
                                 });
                             }
 

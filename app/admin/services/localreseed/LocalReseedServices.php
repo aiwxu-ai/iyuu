@@ -16,6 +16,8 @@ use app\model\LocalReseed;
 use app\model\payload\ReseedPayload;
 use app\model\Reseed;
 use app\model\Site;
+use app\model\SiteTorrent;
+use app\model\SiteIndex;
 use GuzzleHttp\Exception\GuzzleException;
 use InvalidArgumentException;
 use Iyuu\BittorrentClient\ClientEnums;
@@ -25,8 +27,10 @@ use support\Log;
 use Throwable;
 
 /**
- * 本地搜索式辅种服务
- * - 遍历下载器做种种子 → 站内搜索 → 字节级精确体积匹配 → 写入cn_reseed队列（复用投递管线）
+ * 本地辅种服务（索引模式）
+ * - 阶段A 建库：翻页抓取目标站种子索引到 cn_site_torrent（请求只花在这里）
+ * - 阶段B 匹配：本地做种种子 vs 索引库 本地比对（零请求），命中候选下载元数据做字节级确认
+ * - 命中写入 cn_reseed 队列，复用现有投递管线
  */
 final class LocalReseedServices
 {
@@ -35,7 +39,7 @@ final class LocalReseedServices
      */
     public const int DEFAULT_MAX_RUN_SECONDS = 900;
     /**
-     * 每站每轮最大请求数默认值
+     * 每站每轮最大请求数默认值（建库翻页+元数据下载合计）
      */
     public const int DEFAULT_MAX_REQUESTS = 100;
     /**
@@ -43,9 +47,13 @@ final class LocalReseedServices
      */
     public const int DEFAULT_INTERVAL = 5;
     /**
-     * 每次搜索最多下载元数据的候选数默认值
+     * 每个本地种子最多校验的候选数默认值
      */
     public const int DEFAULT_MAX_CANDIDATES = 3;
+    /**
+     * 每轮建库默认翻页数
+     */
+    public const int DEFAULT_INDEX_PAGES = 100;
 
     /**
      * 计划任务：数据模型
@@ -92,7 +100,7 @@ final class LocalReseedServices
      */
     protected string $auto_check = '';
     /**
-     * 含死种搜索：0活种/1含死种/2仅死种
+     * 含死种：0活种/1含死种/2仅死种
      */
     protected int $incldead = 1;
     /**
@@ -100,28 +108,25 @@ final class LocalReseedServices
      */
     protected SearchBudget $budget;
     /**
-     * 每次搜索最多下载元数据的候选数
+     * 每个本地种子最多校验的候选数
      */
     protected int $maxCandidates = self::DEFAULT_MAX_CANDIDATES;
     /**
-     * 统计：本轮新增进度行数
+     * 每轮建库翻页数
+     */
+    protected int $indexPages = self::DEFAULT_INDEX_PAGES;
+    /**
+     * 全库模式
+     */
+    protected bool $fullIndex = false;
+    /**
+     * 统计
      */
     protected int $statNewRows = 0;
-    /**
-     * 统计：命中数
-     */
+    protected int $statIndexNew = 0;
     protected int $statMatched = 0;
-    /**
-     * 统计：无匹配数
-     */
     protected int $statNoMatch = 0;
-    /**
-     * 统计：失败数
-     */
     protected int $statFailed = 0;
-    /**
-     * 统计：跳过数
-     */
     protected int $statSkipped = 0;
 
     /**
@@ -144,7 +149,7 @@ final class LocalReseedServices
             return;
         }
 
-        // 崩溃恢复：搜索中的行重置
+        // 崩溃恢复
         LocalReseed::resetMatching();
 
         $clientIds = [];
@@ -152,7 +157,7 @@ final class LocalReseedServices
             $clientIds[] = (int)$client_id;
         }
 
-        // 同步进度：本地做种种子 × 目标站点
+        // 同步本地做种到进度表
         foreach ($clientIds as $client_id) {
             $torrents = $this->collectSeeding($client_id);
             if (empty($torrents)) {
@@ -161,13 +166,22 @@ final class LocalReseedServices
             foreach ($this->targetSites as $site) {
                 $inserted = LocalReseed::syncProgress($this->crontab_id, $client_id, $torrents, $site);
                 if ($inserted) {
-                    echo "站点 {$site->nickname} 新增待搜进度 {$inserted} 行" . PHP_EOL;
+                    echo "站点 {$site->nickname} 新增待匹配进度 {$inserted} 行" . PHP_EOL;
                     $this->statNewRows += $inserted;
                 }
             }
         }
 
-        $this->consume($clientIds);
+        foreach ($this->targetSites as $site) {
+            // 阶段A 建库
+            $this->buildIndex($site);
+            // 阶段B 本地匹配
+            $this->matchLocal($clientIds, $site);
+            if ($this->budget->timeUp()) {
+                echo '本轮时间预算已耗尽，剩余进度留待下一轮' . PHP_EOL;
+                break;
+            }
+        }
 
         try {
             $this->sendNotify();
@@ -178,129 +192,215 @@ final class LocalReseedServices
     }
 
     /**
-     * 消费进度表：逐站逐行搜索匹配
-     * @param array $client_ids
+     * 阶段A：建库
+     * @param Site $site
      * @return void
      */
-    protected function consume(array $client_ids): void
+    protected function buildIndex(Site $site): void
     {
-        foreach ($this->targetSites as $site) {
-            // 站点限速配置抬升间隔
-            $sleep = 0;
-            try {
-                $limit = (new \Iyuu\SiteManager\Config($site->toArray()))->getLimit();
-                $sleep = (int)($limit['sleep'] ?? 0);
-            } catch (Throwable) {
-            }
-            $this->budget->intervalAtLeast($sleep);
+        // 站点限速配置抬升间隔
+        try {
+            $limit = (new \Iyuu\SiteManager\Config($site->toArray()))->getLimit();
+            $this->budget->intervalAtLeast((int)($limit['sleep'] ?? 0));
+        } catch (Throwable) {
+        }
 
-            $searchServices = new SiteSearchServices($site, $this->incldead, $this->maxCandidates);
-            while (!$this->budget->timeUp() && $this->budget->allow($site->site)) {
-                /** @var LocalReseed|null $row */
-                $row = LocalReseed::nextPending($site->sid, $client_ids);
-                if (!$row) {
-                    echo "站点 {$site->nickname} 待搜进度已消费完毕" . PHP_EOL;
-                    break;
+        try {
+            $crawler = new SiteIndexCrawler($site, $this->budget, $this->incldead);
+            $stat = $crawler->crawl($this->indexPages, $this->fullIndex);
+            $this->statIndexNew += $stat['new_rows'];
+            echo "站点 {$site->nickname} 建库：翻 {$stat['pages']} 页 新增 {$stat['new_rows']} 条 索引总量 {$stat['total']}" . ($stat['full_done'] ? '（全库完成）' : '') . PHP_EOL;
+        } catch (CookieInvalidException $exception) {
+            echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
+            NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
+            return;
+        } catch (Throwable $throwable) {
+            echo "站点 {$site->nickname} 建库异常：" . $throwable->getMessage() . PHP_EOL;
+            NotifyAdmin::warning("站点 {$site->site} 建库异常：" . mb_substr($throwable->getMessage(), 0, 300));
+        }
+    }
+
+    /**
+     * 阶段B：本地匹配（零站点请求，命中候选才下载元数据确认）
+     * - 索引持续增长，无匹配不落终态（始终可重跑）
+     * - 已核验不符的候选ID记录在message，避免重复下载元数据
+     * @param array $client_ids
+     * @param Site $site
+     * @return void
+     */
+    protected function matchLocal(array $client_ids, Site $site): void
+    {
+        // 载入站点索引到内存：title_key => 候选行列表
+        $index = [];
+        SiteTorrent::getBySid($site->sid)
+            ->select(['torrent_id', 'title', 'title_key', 'size_bytes', 'free', 'download_uri'])
+            ->chunk(1000, function ($chunk) use (&$index) {
+                foreach ($chunk as $row) {
+                    $index[$row->title_key][] = [
+                        'torrent_id' => (int)$row->torrent_id,
+                        'title' => (string)$row->title,
+                        'size_bytes' => (int)$row->size_bytes,
+                        'free' => (int)$row->free,
+                        'download_uri' => (string)$row->download_uri,
+                    ];
+                }
+            });
+        if (empty($index)) {
+            echo "站点 {$site->nickname} 索引为空，跳过匹配" . PHP_EOL;
+            return;
+        }
+
+        $verifyServices = new SiteSearchServices($site);
+        $lastId = 0;
+        while (!$this->budget->timeUp()) {
+            /** @var LocalReseed[] $rows 无匹配(2)与失败(4)均可重跑（索引会增长） */
+            $rows = LocalReseed::where('target_sid', '=', $site->sid)
+                ->whereIn('client_id', $client_ids)
+                ->whereIn('status', [LocalReseedStatusEnums::Pending->value, LocalReseedStatusEnums::NoMatch->value, LocalReseedStatusEnums::Failed->value])
+                ->where('id', '>', $lastId)
+                ->orderBy('id')
+                ->limit(300)
+                ->get();
+            if ($rows->isEmpty()) {
+                break;
+            }
+
+            $skipIds = [];
+            foreach ($rows as $row) {
+                $lastId = (int)$row->id;
+                $key = TitleNormalizer::key((string)$row->torrent_name);
+                if ('' === $key) {
+                    $skipIds[] = $row->id;
+                    continue;
                 }
 
-                $row->status = LocalReseedStatusEnums::Matching->value;
-                $row->save();
+                $candidates = $index[$key] ?? [];
+                if (empty($candidates)) {
+                    $this->statNoMatch++;
+                    continue;
+                }
 
-                try {
-                    $this->handleRow($row, $site, $searchServices);
-                } catch (CookieInvalidException $exception) {
-                    // cookie失效：本站本轮中止，剩余行留待搜索
+                // 体积预筛（页面精度容差1%）
+                $sizeOk = array_values(array_filter($candidates, static fn($c) => TitleNormalizer::sizeClose((int)$c['size_bytes'], (int)$row->torrent_size)));
+                if (empty($sizeOk)) {
+                    $this->statNoMatch++;
+                    continue;
+                }
+
+                // 免费优先
+                usort($sizeOk, static fn($a, $b) => ($b['free'] <=> $a['free']));
+
+                // 已核验不符的候选ID（避免重复下载元数据）
+                $verified = [];
+                if (preg_match('/已核:([\d,]+)/u', (string)$row->message, $mV)) {
+                    $verified = array_map('intval', explode(',', $mV[1]));
+                }
+
+                $row->keyword = mb_substr($key, 0, 190);
+                $row->candidates = count($candidates);
+                $row->search_time = time();
+
+                $matched = false;
+                foreach (array_slice($sizeOk, 0, $this->maxCandidates + count($verified)) as $candidate) {
+                    if (in_array((int)$candidate['torrent_id'], $verified, true)) {
+                        continue;
+                    }
+                    if (!$this->budget->allow($site->site)) {
+                        break;
+                    }
+                    $this->budget->hit($site->site);
+                    try {
+                        $result = $verifyServices->verify($candidate, (int)$row->torrent_size);
+                    } catch (CookieInvalidException $exception) {
+                        $row->message = mb_substr($exception->getMessage(), 0, 900);
+                        $row->save();
+                        echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
+                        NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
+                        $this->batchClose($skipIds);
+                        return;
+                    } catch (Throwable $throwable) {
+                        $this->statFailed++;
+                        continue;
+                    }
+
+                    if (LocalReseedStatusEnums::Matched === $result->status) {
+                        $this->enqueue($row, $site, $result);
+                        $matched = true;
+                        $this->statMatched++;
+                        break;
+                    }
+
+                    // 核验不符：记录候选ID
+                    $verified[] = (int)$candidate['torrent_id'];
+                }
+
+                if (!$matched) {
                     $row->status = LocalReseedStatusEnums::Pending->value;
-                    $row->message = mb_substr($exception->getMessage(), 0, 900);
+                    $row->message = $verified ? '已核:' . implode(',', $verified) : '';
                     $row->save();
-                    echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
-                    NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
+                    $this->statNoMatch++;
+                }
+                if ($this->budget->timeUp()) {
                     break;
-                } catch (Throwable $throwable) {
-                    $row->status = LocalReseedStatusEnums::Failed->value;
-                    $row->message = mb_substr($throwable->getMessage(), 0, 900);
-                    $row->save();
-                    $this->statFailed++;
-                    echo '进度行处理异常：' . $throwable->getMessage() . PHP_EOL;
                 }
             }
 
-            if ($this->budget->timeUp()) {
-                echo '本轮时间预算已耗尽，剩余进度留待下一轮' . PHP_EOL;
+            $this->batchClose($skipIds);
+            if ($rows->count() < 300) {
                 break;
             }
         }
     }
 
     /**
-     * 处理单行进度
-     * @param LocalReseed $row
-     * @param Site $site
-     * @param SiteSearchServices $searchServices
+     * 批量关闭进度行（不可搜索名称）
+     * @param array $skipIds
      * @return void
      */
-    protected function handleRow(LocalReseed $row, Site $site, SiteSearchServices $searchServices): void
+    protected function batchClose(array $skipIds): void
     {
-        $row->search_time = time();
-        $keyword = SearchKeywordBuilder::build($row->torrent_name);
-        if (null === $keyword) {
-            $row->status = LocalReseedStatusEnums::Skipped->value;
-            $row->message = '名称不适合搜索';
-            $row->save();
-            $this->statSkipped++;
-            return;
-        }
-        $row->keyword = $keyword;
-
-        $this->budget->hit($site->site);    // 搜索请求计数+休眠
-        $result = $searchServices->searchAndMatch($keyword, (int)$row->torrent_size);
-
-        $row->candidates = $result->candidates;
-        if (LocalReseedStatusEnums::Matched === $result->status) {
-            // 有效载荷
-            $reseedPayload = new ReseedPayload();
-            $reseedPayload->marker = $this->downloaderMarkerEnums->value;
-            $reseedPayload->auto_check = $this->auto_check;
-
-            $attributes = [
-                'client_id' => $this->masterModel ? $this->masterModel->id : $row->client_id,
-                'info_hash' => $result->infoHash,
-            ];
-            $values = [
-                'site' => $site->site,
-                'sid' => $site->sid,
-                'torrent_id' => $result->torrentId,
-                'group_id' => 0,
-                'directory' => $row->directory,
-                'dispatch_time' => 0,
-                'status' => ReseedStatusEnums::Default->value,
-                'subtype' => ReseedSubtypeEnums::Local->value,
-                'payload' => (string)$reseedPayload
-            ];
-            $reseedModel = Reseed::firstOrCreate($attributes, $values);
-            $row->reseed_id = (int)$reseedModel->reseed_id;
-            $row->status = LocalReseedStatusEnums::Matched->value;
-            $row->message = '命中：' . $result->name;
-            $this->statMatched++;
-            echo "命中 站点 {$site->site} 种子ID {$result->torrentId} 体积 {$row->torrent_size} 搜索词 {$keyword}" . PHP_EOL;
-        } else {
-            $row->status = $result->status;
-            $row->message = $result->message;
-            if (LocalReseedStatusEnums::NoMatch === $result->status) {
-                $this->statNoMatch++;
-            } elseif (LocalReseedStatusEnums::Failed === $result->status) {
-                $this->statFailed++;
-            } elseif (LocalReseedStatusEnums::Skipped === $result->status) {
-                $this->statSkipped++;
+        if ($skipIds) {
+            foreach (array_chunk($skipIds, 500) as $chunk) {
+                LocalReseed::whereIn('id', $chunk)->update(['status' => LocalReseedStatusEnums::Skipped->value, 'search_time' => time()]);
             }
+            $this->statSkipped += count($skipIds);
         }
-        $row->save();
+    }
 
-        // 元数据下载也计入预算（每个候选一次）
-        $used = min($result->candidates, $this->maxCandidates);
-        for ($i = 0; $i < $used; $i++) {
-            $this->budget->allow($site->site) && $this->budget->hit($site->site);
-        }
+    /**
+     * 命中入队 cn_reseed（复用投递管线）
+     * @param LocalReseed $row
+     * @param Site $site
+     * @param MatchResult $result
+     * @return void
+     */
+    protected function enqueue(LocalReseed $row, Site $site, MatchResult $result): void
+    {
+        $reseedPayload = new ReseedPayload();
+        $reseedPayload->marker = $this->downloaderMarkerEnums->value;
+        $reseedPayload->auto_check = $this->auto_check;
+
+        $attributes = [
+            'client_id' => $this->masterModel ? $this->masterModel->id : $row->client_id,
+            'info_hash' => $result->infoHash,
+        ];
+        $values = [
+            'site' => $site->site,
+            'sid' => $site->sid,
+            'torrent_id' => $result->torrentId,
+            'group_id' => 0,
+            'directory' => $row->directory,
+            'dispatch_time' => 0,
+            'status' => ReseedStatusEnums::Default->value,
+            'subtype' => ReseedSubtypeEnums::Local->value,
+            'payload' => (string)$reseedPayload
+        ];
+        $reseedModel = Reseed::firstOrCreate($attributes, $values);
+        $row->reseed_id = (int)$reseedModel->reseed_id;
+        $row->status = LocalReseedStatusEnums::Matched->value;
+        $row->message = '命中：' . $result->name;
+        $row->save();
+        echo "命中 站点 {$site->site} 种子ID {$result->torrentId} 体积 {$row->torrent_size} 标题 {$result->name}" . PHP_EOL;
     }
 
     /**
@@ -335,7 +435,6 @@ final class LocalReseedServices
 
         foreach ($rows as $hash => $row) {
             $directory = (string)($row['save_path'] ?? $row['downloadDir'] ?? '');
-            // 路径过滤器
             if ($this->isPathFiltered($directory)) {
                 continue;
             }
@@ -411,7 +510,6 @@ final class LocalReseedServices
                 continue;
             }
 
-            // 必须实现了HTML解析接口（Cookie驱动存在）
             $cookieClass = \Iyuu\SiteManager\BaseCookie::siteToClass($siteModel->site);
             if (!is_subclass_of($cookieClass, \Iyuu\SiteManager\BaseCookie::class)) {
                 echo "站点 {$siteModel->site} 未适配爬虫驱动，跳过" . PHP_EOL;
@@ -437,7 +535,8 @@ final class LocalReseedServices
         $text = 'IYUU本地辅种-统计报表';
         $desp = '### 网站名称：' . get_system_title() . $br;
         $desp .= '**目标站点：' . implode('、', array_keys($this->targetSites)) . '**' . $br;
-        $desp .= '**新增进度：' . $this->statNewRows . '**' . $br;
+        $desp .= '**索引新增：' . $this->statIndexNew . '**  [本轮建库新增的站内种子数]' . $br;
+        $desp .= '**新增进度：' . $this->statNewRows . '**  [本地新做种数]' . $br;
         $desp .= '**命中：' . $this->statMatched . '**' . $br;
         $desp .= '**无匹配：' . $this->statNoMatch . '**' . $br;
         $desp .= '**失败：' . $this->statFailed . '**' . $br;
@@ -473,19 +572,19 @@ final class LocalReseedServices
         }
         $sites = $parameter['sites'] ?? [];
         $clients = $parameter['clients'] ?? [];
-        // 路径过滤器
         if ($path_filter = $parameter['path_filter'] ?? []) {
             $this->path_filter = Folder::whereIn('folder_id', explode(',', $path_filter))->pluck('folder_value')->toArray();
         }
 
         $notify_channel = $parameter['notify_channel'] ?? '';
-        $marker = DownloaderMarkerEnums::from($parameter['marker'] ?? DownloaderMarkerEnums::Empty->value);
+        $marker = DownloaderMarkerEnums::from((string)($parameter['marker'] ?? DownloaderMarkerEnums::Empty->value));
         $auto_check = $parameter['auto_check'] ?? '';
         $this->incldead = (int)($parameter['incldead'] ?? 1);
         $max_candidates = (int)($parameter['max_candidates'] ?? self::DEFAULT_MAX_CANDIDATES);
         $this->maxCandidates = max(1, min(10, $max_candidates));
+        $this->indexPages = max(1, (int)($parameter['index_pages'] ?? self::DEFAULT_INDEX_PAGES));
+        $this->fullIndex = (bool)($parameter['full_index'] ?? false);
 
-        // 主辅种下载的主键id
         $master = $parameter['master'] ?? null;
         if ($master) {
             $this->masterModel = ClientServices::getClient((int)$master);
@@ -502,7 +601,7 @@ final class LocalReseedServices
         $this->crontabModel = $crontabModel;
         $this->crontabSites = $sites;
         $this->crontabClients = $clients;
-        $this->notifyEnum = NotifyChannelEnums::tryFrom($notify_channel);
+        $this->notifyEnum = NotifyChannelEnums::tryFrom((string)$notify_channel);
         $this->downloaderMarkerEnums = $marker;
         $this->auto_check = $auto_check;
     }

@@ -103,19 +103,35 @@ class LocalReseedTemplate extends CrontabAbstract
     </div>
 </div>
 <div class="layui-form-item">
-    <label class="layui-form-label required">搜索范围</label>
+    <label class="layui-form-label required">索引范围</label>
     <div class="layui-input-block">
         <input type="radio" name="parameter[incldead]" value="0" title="仅活种">
         <input type="radio" name="parameter[incldead]" value="1" title="含死种" checked>
         <input type="radio" name="parameter[incldead]" value="2" title="仅死种">
     </div>
+    <div class="layui-form-mid layui-text-em">建库时索引的种子范围（含死种辅种价值更高）</div>
+</div>
+<div class="layui-form-item">
+    <label class="layui-form-label required">建库模式</label>
+    <div class="layui-input-block">
+        <input type="radio" name="parameter[full_index]" value="0" title="增量(追新)" checked>
+        <input type="radio" name="parameter[full_index]" value="1" title="全库(断点续建)">
+    </div>
+    <div class="layui-form-mid layui-text-em">全库模式：持续翻页建完整索引，多轮跑完自动转增量；增量模式：只追最新几页新种</div>
+</div>
+<div class="layui-form-item">
+    <label class="layui-form-label">建库页数</label>
+    <div class="layui-input-inline layui-input-wrap">
+        <input type="number" name="parameter[index_pages]" value="100" min="1" class="layui-input">
+    </div>
+    <div class="layui-form-mid layui-text-em">每站每轮最多翻页数(每页100种)，全库未建成前建议调大</div>
 </div>
 <div class="layui-form-item">
     <label class="layui-form-label">候选上限</label>
     <div class="layui-input-inline layui-input-wrap">
         <input type="number" name="parameter[max_candidates]" value="3" min="1" max="10" lay-verify="number" class="layui-input">
     </div>
-    <div class="layui-form-mid layui-text-em">每次搜索最多下载元数据比对的候选数(1-10)</div>
+    <div class="layui-form-mid layui-text-em">每个本地种子最多下载元数据校验的候选数(1-10)</div>
 </div>
 <div class="layui-form-item">
     <label class="layui-form-label">请求间隔</label>
@@ -129,7 +145,7 @@ class LocalReseedTemplate extends CrontabAbstract
     <div class="layui-input-inline layui-input-wrap">
         <input type="number" name="parameter[max_requests]" value="100" min="1" class="layui-input">
     </div>
-    <div class="layui-form-mid layui-text-em">每站每轮最大请求数(搜索+元数据合计)，剩余下一轮续跑</div>
+    <div class="layui-form-mid layui-text-em">每站每轮最大请求数(建库翻页+元数据合计)，剩余下一轮续跑</div>
 </div>
 <div class="layui-form-item">
     <label class="layui-form-label">单轮时间</label>
