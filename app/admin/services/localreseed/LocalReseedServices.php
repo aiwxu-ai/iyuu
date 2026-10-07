@@ -937,7 +937,7 @@ final class LocalReseedServices
             // firstOrCreate的select-then-insert会双双插入→同一辅种被投递两次（第二次在下载器侧报重复）。
             // 用MySQL用户级锁把同(client,hash)的入队串行化；必须取模型自己的连接（plugin.admin.mysql），
             // 锁与firstOrCreate走同一物理连接才有效
-            $connection = Reseed::query()->getConnection();
+            $connection = (new Reseed())->getConnection();
             $connection->select('SELECT GET_LOCK(?, 5)', [$lockKey]);
             $reseedModel = Reseed::firstOrCreate($attributes, $values);
         } catch (Throwable) {
