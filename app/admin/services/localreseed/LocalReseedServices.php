@@ -22,6 +22,7 @@ use GuzzleHttp\Exception\GuzzleException;
 use InvalidArgumentException;
 use Iyuu\BittorrentClient\ClientEnums;
 use Iyuu\BittorrentClient\Exception\NotFoundException;
+use Iyuu\BittorrentClient\Utils;
 use plugin\cron\app\model\Crontab;
 use support\Log;
 use Throwable;
@@ -411,11 +412,13 @@ final class LocalReseedServices
                 if (LocalReseedStatusEnums::Matched->value !== (int)$row->status) {
                     if ($verified) {
                         $row->message = self::composeVerifiedMessage($verified);
-                        LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, [
-                            'message' => $row->message,
-                            'search_time' => time(),
-                        ]);
                     }
+                    // search_time必须无条件同步全部兄弟行：同hash兄弟行(其他客户端)名称相同→搜索词相同，
+                    // 只在有否决结论时同步会让兄弟行下轮(或本轮后段MIN(id)轮换)重复搜索同一token，白烧搜索预算
+                    LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, $verified ? [
+                        'message' => $row->message,
+                        'search_time' => time(),
+                    ] : ['search_time' => time()]);
                     $row->save();
                 }
             }
@@ -694,11 +697,15 @@ final class LocalReseedServices
                         continue;
                     }
                     if (!$this->budget->allow($site->site)) {
-                        // 预算耗尽也要落库本轮否决记忆，否则下轮重复下载同一元数据
+                        // 预算耗尽也要落库本轮否决记忆并同步兄弟行，否则下轮重复下载同一元数据
                         if ($verified) {
                             $row->message = self::composeVerifiedMessage($verified);
-                            $row->save();
+                            LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, [
+                                'message' => $row->message,
+                                'search_time' => time(),
+                            ]);
                         }
+                        $row->save();
                         echo "校验预算耗尽(used={$this->budget->used($site->site)})，停止扫描" . PHP_EOL;
                         break 2;
                     }
@@ -1052,8 +1059,10 @@ final class LocalReseedServices
         $max_candidates = (int)($parameter['max_candidates'] ?? self::DEFAULT_MAX_CANDIDATES);
         $this->maxCandidates = max(1, min(10, $max_candidates));
         $this->indexPages = max(1, (int)($parameter['index_pages'] ?? self::DEFAULT_INDEX_PAGES));
-        $this->fullIndex = (bool)($parameter['full_index'] ?? false);
-        $this->bucketMatch = (bool)($parameter['bucket_match'] ?? false);
+        // 表单radio提交的是字符串"0"/"1"：(bool)"0"===true会让「关闭/增量」选项反向生效
+        // （体积桶假阳性路径被打开、全库深爬被启动），必须走项目的字符串布尔解析
+        $this->fullIndex = Utils::booleanParse($parameter['full_index'] ?? false);
+        $this->bucketMatch = Utils::booleanParse($parameter['bucket_match'] ?? false);
 
         $master = $parameter['master'] ?? null;
         if ($master) {
