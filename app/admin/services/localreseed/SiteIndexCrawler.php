@@ -54,8 +54,12 @@ final class SiteIndexCrawler
         $state = SiteIndex::getOrNew($this->site->sid, $this->site->site);
         $state->last_time = time();
 
-        // 全库模式断点续建：从上次最大页码+1继续翻深；增量模式（或全库已完成）从第0页追新
-        $resume = $fullMode && !(1 === (int)$state->full_done) && (int)$state->last_page >= 0;
+        // 全库已完成（或未开全库）一律按增量语义追新：full_done后仍保持全库语义的话，
+        // 已知比例停止被短路，每轮都从第0页重翻 index_pages 页已索引内容，烧光整轮站点请求预算
+        $fullMode = $fullMode && !(1 === (int)$state->full_done);
+
+        // 全库模式断点续建：从上次最大页码+1继续翻深；增量模式从第0页追新
+        $resume = $fullMode && (int)$state->last_page >= 0;
         $page = $resume ? ((int)$state->last_page + 1) : 0;
 
         $pages = 0;
@@ -64,71 +68,83 @@ final class SiteIndexCrawler
         $emptyStreak = 0;
         $parseAnomalyStreak = 0;
         $lastFetched = -1;
-        while ($pages < $maxPages && $this->budget->allow($this->site->site)) {
-            // 先记账再请求：失败的请求同样计入预算与台账
-            $this->budget->hit($this->site->site);
-            $html = $this->fetchPage($page);
-            $pages++;
-            $lastFetched = $page;
+        try {
+            while ($pages < $maxPages && $this->budget->allow($this->site->site)) {
+                // 先记账再请求：失败的请求同样计入预算与台账
+                $this->budget->hit($this->site->site);
+                try {
+                    $html = $this->fetchPage($page);
+                } catch (CookieInvalidException $cookieInvalid) {
+                    throw $cookieInvalid;    // cookie失效是站点级事件：落库断点后向上抛（buildIndex统一提示中止）
+                } catch (RuntimeException $exception) {
+                    // 瞬时网络错误：保存断点结束本轮。直接上抛会跳过末尾的状态落库，
+                    // 全库模式下轮会从旧断点重抓本轮全部页面，白烧一整轮翻页预算
+                    echo '抓取列表页瞬时失败，本轮建库提前结束：' . $exception->getMessage() . PHP_EOL;
+                    break;
+                }
+                $pages++;
+                $lastFetched = $page;
 
-            $rows = $this->parse($html);
-            if (empty($rows)) {
-                // 空页三振判定：页面含种子表特征但解析0行=解析异常(不置完成)；连续真空页才到底
-                $pageHasTable = str_contains($html, 'torrentname') || str_contains($html, 'details.php?id=');
-                if ($pageHasTable) {
-                    $emptyStreak = 0;    // 解析异常，不当到底
-                    // 连续解析异常也三振出局：否则模板一变每轮都会把整站翻页预算烧光
-                    if (++$parseAnomalyStreak >= self::FULL_DONE_EMPTY_STREAK) {
+                $rows = $this->parse($html);
+                if (empty($rows)) {
+                    // 空页三振判定：页面含种子表特征但解析0行=解析异常(不置完成)；连续真空页才到底
+                    $pageHasTable = str_contains($html, 'torrentname') || str_contains($html, 'details.php?id=');
+                    if ($pageHasTable) {
+                        $emptyStreak = 0;    // 解析异常，不当到底
+                        // 连续解析异常也三振出局：否则模板一变每轮都会把整站翻页预算烧光
+                        if (++$parseAnomalyStreak >= self::FULL_DONE_EMPTY_STREAK) {
+                            break;
+                        }
+                    } elseif (++$emptyStreak >= self::FULL_DONE_EMPTY_STREAK && $fullMode) {
+                        $fullDone = true;
+                    }
+                    if ($fullDone || $emptyStreak >= self::FULL_DONE_EMPTY_STREAK) {
                         break;
                     }
-                } elseif (++$emptyStreak >= self::FULL_DONE_EMPTY_STREAK && $fullMode) {
-                    $fullDone = true;
+                    $page++;
+                    continue;
                 }
-                if ($fullDone || $emptyStreak >= self::FULL_DONE_EMPTY_STREAK) {
-                    break;
+                $emptyStreak = 0;
+                $parseAnomalyStreak = 0;
+
+                // 分页器最大页码：已到尾页则全库完成（NexusPHP超尾页会钳制回最后一页，不能靠空页判断）
+                if ($fullMode && preg_match_all('/[?&]page=(\d+)/', $html, $mPages)) {
+                    $maxPage = (int)max($mPages[1]);
+                    if ($page >= $maxPage) {
+                        $newRows += $this->upsert($rows);
+                        $fullDone = true;
+                        break;
+                    }
                 }
+
+                $inserted = $this->upsert($rows);
+                $newRows += $inserted;
+
+                // 增量模式：非置顶种子已索引比例高 → 停止翻页
+                if (!$fullMode) {
+                    $nonSticky = array_filter($rows, static fn($r) => 0 === (int)$r['sticky']);
+                    $nonStickyCount = count($nonSticky) ?: count($rows);
+                    $knownCount = count($nonSticky) - $inserted;
+                    if ($nonStickyCount > 0 && ($knownCount / $nonStickyCount) >= self::KNOWN_RATIO_STOP) {
+                        break;
+                    }
+                }
+
                 $page++;
-                continue;
             }
-            $emptyStreak = 0;
-            $parseAnomalyStreak = 0;
-
-            // 分页器最大页码：已到尾页则全库完成（NexusPHP超尾页会钳制回最后一页，不能靠空页判断）
-            if ($fullMode && preg_match_all('/[?&]page=(\d+)/', $html, $mPages)) {
-                $maxPage = (int)max($mPages[1]);
-                if ($page >= $maxPage) {
-                    $newRows += $this->upsert($rows);
-                    $fullDone = true;
-                    break;
-                }
+        } finally {
+            // 断点续跑off-by-one修复：last_page必须记「最后一个已抓取页」，
+            // 记成「下一个未抓取页」会让每轮被中断的全库任务永久跳过一页。
+            // 放在finally：任何退出路径（瞬时失败/cookie失效/预算耗尽）都不丢断点
+            if ($lastFetched > (int)$state->last_page) {
+                $state->last_page = $lastFetched;
             }
-
-            $inserted = $this->upsert($rows);
-            $newRows += $inserted;
-
-            // 增量模式：非置顶种子已索引比例高 → 停止翻页
-            if (!$fullMode) {
-                $nonSticky = array_filter($rows, static fn($r) => 0 === (int)$r['sticky']);
-                $nonStickyCount = count($nonSticky) ?: count($rows);
-                $knownCount = count($nonSticky) - $inserted;
-                if ($nonStickyCount > 0 && ($knownCount / $nonStickyCount) >= self::KNOWN_RATIO_STOP) {
-                    break;
-                }
+            if ($fullDone) {
+                $state->full_done = 1;
             }
-
-            $page++;
+            $state->total_indexed = SiteTorrent::getBySid($this->site->sid)->count();
+            $state->save();
         }
-
-        // 断点续跑off-by-one修复：last_page必须记「最后一个已抓取页」，
-        // 记成「下一个未抓取页」会让每轮被中断的全库任务永久跳过一页
-        if ($lastFetched > (int)$state->last_page) {
-            $state->last_page = $lastFetched;
-        }
-        if ($fullDone) {
-            $state->full_done = 1;
-        }
-        $state->total_indexed = SiteTorrent::getBySid($this->site->sid)->count();
-        $state->save();
 
         return ['pages' => $pages, 'new_rows' => $newRows, 'total' => (int)$state->total_indexed, 'full_done' => $fullDone];
     }

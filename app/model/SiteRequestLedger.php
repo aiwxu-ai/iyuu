@@ -4,6 +4,7 @@ namespace app\model;
 
 use Illuminate\Database\Eloquent\Builder;
 use plugin\admin\app\model\Base;
+use support\Db;
 use Throwable;
 
 /**
@@ -88,39 +89,43 @@ class SiteRequestLedger extends Base
 
     /**
      * 记一次请求（跨天自动重置计数）
+     * 合并为单条原子UPDATE：原「先重置再自增」两条语句之间存在并发窗口——
+     * 本进程的跨天重置会把另一进程刚写入的当日计数吞回0，日限计数少记。
+     * 注意：MySQL的SET按书写顺序求值，requests/consec_fail的IF必须排在day赋值之前（读旧day）
      * @param string $site
      * @return void
      */
     public static function charge(string $site): void
     {
         $today = date('Y-m-d');
-        static::where('site', '=', $site)->where('day', '<>', $today)
-            ->update(['day' => $today, 'requests' => 0, 'consec_fail' => 0]);
-        static::where('site', '=', $site)->increment('requests', 1, ['last_ts' => time()]);
+        $payload = [
+            'requests' => Db::raw("IF(day = '{$today}', requests + 1, 1)"),
+            'consec_fail' => Db::raw("IF(day = '{$today}', consec_fail, 0)"),
+            'day' => $today,
+            'last_ts' => time(),
+        ];
+        if (0 === static::where('site', '=', $site)->update($payload)) {
+            // 行尚不存在（理论不可达：allow()已先经getOrNew建行）：补建后重试一次
+            static::getOrNew($site);
+            static::where('site', '=', $site)->update($payload);
+        }
     }
 
     /**
      * 记一次失败（连续3次触发熔断）
+     * 原子自增+条件更新：原「读-改-写」在并发下互相覆盖（两个进程同读consec_fail=1、
+     * 各写2，丢一次计数），连续失败计数偏低会延迟甚至错失熔断触发
      * @param string $site
      * @param int $cooldownSeconds 熔断时长
      * @return bool 是否触发了熔断
      */
     public static function fail(string $site, int $cooldownSeconds = 86400): bool
     {
-        /** @var self|null $model */
-        $model = static::where('site', '=', $site)->first();
-        if (null === $model) {
-            return false;
-        }
-        $model->consec_fail = (int)$model->consec_fail + 1;
-        $tripped = false;
-        if ($model->consec_fail >= 3) {
-            $model->cooldown_until = time() + $cooldownSeconds;
-            $model->consec_fail = 0;
-            $tripped = true;
-        }
-        $model->save();
-        return $tripped;
+        static::where('site', '=', $site)->increment('consec_fail', 1);
+        // 只有把计数推过阈值的那次更新才置熔断：条件更新天然去重，并发不会重复触发
+        return (bool)static::where('site', '=', $site)
+            ->where('consec_fail', '>=', 3)
+            ->update(['cooldown_until' => time() + $cooldownSeconds, 'consec_fail' => 0]);
     }
 
     /**

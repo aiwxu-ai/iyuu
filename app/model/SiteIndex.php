@@ -3,6 +3,7 @@
 namespace app\model;
 
 use plugin\admin\app\model\Base;
+use Throwable;
 
 /**
  * 站点索引抓取进度
@@ -41,6 +42,8 @@ class SiteIndex extends Base
 
     /**
      * 获取或创建站点进度模型
+     * 并发进程同时首建时靠uk_sid唯一键去重：冲突方重取现有行（与SiteRequestLedger::getOrNew一致），
+     * 否则重叠跑同站的任务会有一个直接以「建库异常」崩掉本轮
      * @param int $sid
      * @param string $site
      * @return self
@@ -54,7 +57,15 @@ class SiteIndex extends Base
             $model->sid = $sid;
             $model->site = $site;
             $model->last_page = -1;
-            $model->save();
+            try {
+                $model->save();
+            } catch (Throwable) {
+                /** @var self|null $existing */
+                $existing = static::where('sid', '=', $sid)->first();
+                if (null !== $existing) {
+                    $model = $existing;
+                }
+            }
         }
         return $model;
     }

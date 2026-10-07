@@ -72,6 +72,13 @@ final class LocalReseedServices
      */
     protected const float SEARCH_GUIDED_SLICE_RATIO = 0.4;
     /**
+     * 已核否决记忆上限（持久化在message「已核:」列表）
+     * - 60个ID约540字符，message varchar(1000)内安全
+     * - 达到上限的行不再发起校验：否则「保留最近N个」的淘汰策略会让最早（体积最接近的）
+     *   候选被淘汰后又在下轮首个被重验，形成永不收敛的重验循环，每轮烧掉maxCandidates个请求
+     */
+    protected const int VERIFIED_MEMORY_CAP = 60;
+    /**
      * 搜索词排除的通用词（无区分度；分辨率/编码类token由结构正则排除）
      */
     protected const array SEARCH_STOPWORDS = ['the', 'and', 'for', 'with', 'from', 'into', 'season', 'complete', 'multi', 'audio', 'dual', 'proper', 'repack', 'extended', 'remastered', 'internal', 'limited', 'unrated', 'runtime', 'subbed', 'chinese', 'english', 'jun', 'part',
@@ -223,9 +230,20 @@ final class LocalReseedServices
             // 阶段A 建库
             $this->buildIndex($site);
             // 阶段B 本地匹配（标题键候选精度最高，优先吃校验预算）
-            $this->matchLocal($clientIds, $site);
+            // 每站每阶段隔离异常：单站DB/解析异常不能中断后续站点整轮任务（buildIndex同理）
+            try {
+                $this->matchLocal($clientIds, $site);
+            } catch (Throwable $throwable) {
+                echo "站点 {$site->nickname} 本地匹配异常：" . $throwable->getMessage() . PHP_EOL;
+                NotifyAdmin::warning("站点 {$site->site} 本地匹配异常：" . mb_substr($throwable->getMessage(), 0, 300));
+            }
             // 阶段A2 关键词引导搜索（IYUU跨站已验证hash优先，用剩余预算）
-            $this->searchGuided($site);
+            try {
+                $this->searchGuided($site);
+            } catch (Throwable $throwable) {
+                echo "站点 {$site->nickname} 引导搜索异常：" . $throwable->getMessage() . PHP_EOL;
+                NotifyAdmin::warning("站点 {$site->site} 引导搜索异常：" . mb_substr($throwable->getMessage(), 0, 300));
+            }
             if ($this->budget->timeUp()) {
                 echo '本轮时间预算已耗尽，剩余进度留待下一轮' . PHP_EOL;
                 break;
@@ -378,7 +396,9 @@ final class LocalReseedServices
                 // 已否决候选直接排除（跨轮message记忆+进程内缓存）：否则每次12小时重搜都会重复下载同一元数据
                 $cachedNo = $this->siteVerifyCache[$hash]['no'] ?? [];
                 $cands = array_values(array_filter($cands, static fn($c) => !in_array((int)$c['torrent_id'], $verified, true) && !in_array((int)$c['torrent_id'], $cachedNo, true)));
-                foreach (array_slice($cands, 0, 2) as $cand) {
+                // 否决记忆已满：候选池被深度否决仍未命中，不再下载元数据（防淘汰-重验循环烧请求）
+                $verifyQuotaOver = count($verified) >= self::VERIFIED_MEMORY_CAP;
+                foreach ($verifyQuotaOver ? [] : array_slice($cands, 0, 2) as $cand) {
                     if (!$this->budget->allow($site->site)) {
                         break;
                     }
@@ -387,8 +407,10 @@ final class LocalReseedServices
                     try {
                         $result = $verifyServices->verify($cand, $localSize, $hash);
                     } catch (CookieInvalidException $exception) {
-                        $row->message = mb_substr($exception->getMessage(), 0, 900);
-                        $row->save();
+                        // 条件更新：不覆盖并发进程可能刚写入的命中状态/消息
+                        LocalReseed::where('id', (int)$row->id)
+                            ->where('status', '<>', LocalReseedStatusEnums::Matched->value)
+                            ->update(['message' => mb_substr($exception->getMessage(), 0, 900)]);
                         echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
                         NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
                         return;
@@ -410,17 +432,24 @@ final class LocalReseedServices
                 }
 
                 if (LocalReseedStatusEnums::Matched->value !== (int)$row->status) {
-                    if ($verified) {
-                        $row->message = self::composeVerifiedMessage($verified);
-                    }
-                    // search_time必须无条件同步全部兄弟行：同hash兄弟行(其他客户端)名称相同→搜索词相同，
-                    // 只在有否决结论时同步会让兄弟行下轮(或本轮后段MIN(id)轮换)重复搜索同一token，白烧搜索预算
-                    LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, $verified ? [
-                        'message' => $row->message,
-                        'search_time' => time(),
-                    ] : ['search_time' => time()]);
-                    $row->save();
+                    // 条件更新（status<>已命中）：并发进程可能刚把本行置为Matched，
+                    // 无条件save会覆盖其“命中”消息（模型载入早于对方的写入，内存态已过期）
+                    LocalReseed::where('id', (int)$row->id)
+                        ->where('status', '<>', LocalReseedStatusEnums::Matched->value)
+                        ->update([
+                            'keyword' => (string)$row->keyword,
+                            'candidates' => (int)$row->candidates,
+                            'search_time' => (int)$row->search_time,
+                            'message' => $verified ? self::composeVerifiedMessage($verified) : (string)$row->message,
+                        ]);
                 }
+                // search_time必须无条件同步全部兄弟行：同hash兄弟行(其他客户端)名称相同→搜索词相同，
+                // 只在有否决结论时同步会让兄弟行下轮(或本轮后段MIN(id)轮换)重复搜索同一token，白烧搜索预算；
+                // 已命中时(master模式兄弟行未连带入队)同样要同步，否则下轮引导搜索还会重搜该hash
+                LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, $verified ? [
+                    'message' => self::composeVerifiedMessage($verified),
+                    'search_time' => (int)$row->search_time,
+                ] : ['search_time' => (int)$row->search_time]);
             }
         }
 
@@ -586,6 +615,11 @@ final class LocalReseedServices
                 // hash级短路：同hash行本进程内已有终态结论
                 $hash = (string)$row->info_hash;
                 if (isset($verifyCache[$hash]['ok'])) {
+                    // 先行行enqueueFamily可能已连带入队本行（同批次300行内的兄弟行）：
+                    // 重复enqueue虽然幂等，但statMatched会重复计数、重复echo“命中”
+                    if (LocalReseedStatusEnums::Matched->value === (int)$row->status) {
+                        continue;
+                    }
                     $cachedOk = $verifyCache[$hash]['ok'];
                     $this->enqueue($row, $site, MatchResult::matched((int)$cachedOk[0], (string)$cachedOk[1], (string)$cachedOk[2], 1));
                     continue;
@@ -656,8 +690,7 @@ final class LocalReseedServices
                         }
                     }
                     if (empty($candidates)) {
-                        $this->statNoMatch++;
-                        continue;
+                        continue;    // 无桶候选不是终局结论（索引还会增长），不计入无匹配统计
                     }
                 }
                 $statCandidates++;
@@ -671,7 +704,10 @@ final class LocalReseedServices
                 $floor = $passExact ? 12582912 : 6291456;
                 $sizeOk = array_values(array_filter($candidates, static fn($c) => TitleNormalizer::sizeClose((int)$c['size_bytes'], $localSize, 0.0025, $floor)));
                 if (empty($sizeOk)) {
-                    $this->statNoMatch++;
+                    // 标题全等候选全数体积不符=确定非同发布；只在第一遍计一次（第二遍会对同一行重复计数）
+                    if ($passExact) {
+                        $this->statNoMatch++;
+                    }
                     continue;
                 }
 
@@ -686,6 +722,12 @@ final class LocalReseedServices
                 if (preg_match('/已核:([\d,]+)/u', (string)$row->message, $mV)) {
                     $verified = array_map('intval', explode(',', $mV[1]));
                 }
+                // 否决记忆已满：候选池被深度否决仍未命中，本行休眠不再发起校验。
+                // 否则「保留最近N个」的淘汰会让最早（体积最接近的）候选被挤出列表后
+                // 又在下轮首个被重验，永不收敛，每轮白烧maxCandidates个元数据请求
+                if (count($verified) >= self::VERIFIED_MEMORY_CAP) {
+                    continue;
+                }
 
                 $row->keyword = mb_substr($key, 0, 190);
                 $row->candidates = count($candidates);
@@ -699,13 +741,23 @@ final class LocalReseedServices
                     if (!$this->budget->allow($site->site)) {
                         // 预算耗尽也要落库本轮否决记忆并同步兄弟行，否则下轮重复下载同一元数据
                         if ($verified) {
-                            $row->message = self::composeVerifiedMessage($verified);
                             LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, [
-                                'message' => $row->message,
+                                'message' => self::composeVerifiedMessage($verified),
                                 'search_time' => time(),
                             ]);
                         }
-                        $row->save();
+                        // 条件更新（status<>已命中）：并发进程可能刚把本行置为Matched（兄弟行连带入队），
+                        // 无条件save会覆盖其“命中”消息；而状态回退会让行被NOT EXISTS永久排除后卡死在“待搜索”
+                        LocalReseed::where('id', (int)$row->id)
+                            ->where('status', '<>', LocalReseedStatusEnums::Matched->value)
+                            ->update([
+                                'keyword' => (string)$row->keyword,
+                                'candidates' => (int)$row->candidates,
+                                'search_time' => (int)$row->search_time,
+                                'message' => $verified ? self::composeVerifiedMessage($verified) : (string)$row->message,
+                            ]);
+                        // 中断出口也要关闭本批不可匹配行：丢掉skipIds会让这些行永远停在Pending，每轮重取重判
+                        $this->batchClose($skipIds);
                         echo "校验预算耗尽(used={$this->budget->used($site->site)})，停止扫描" . PHP_EOL;
                         break 2;
                     }
@@ -714,8 +766,10 @@ final class LocalReseedServices
                     try {
                         $result = $verifyServices->verify($candidate, $localSize, $hash);
                     } catch (CookieInvalidException $exception) {
-                        $row->message = mb_substr($exception->getMessage(), 0, 900);
-                        $row->save();
+                        // 条件更新：不覆盖并发进程可能刚写入的命中状态/消息
+                        LocalReseed::where('id', (int)$row->id)
+                            ->where('status', '<>', LocalReseedStatusEnums::Matched->value)
+                            ->update(['message' => mb_substr($exception->getMessage(), 0, 900)]);
                         echo $exception->getMessage() . '，本站本轮中止' . PHP_EOL;
                         NotifyAdmin::warning($exception->getMessage() . '，本站本轮中止');
                         $this->batchClose($skipIds);
@@ -741,19 +795,29 @@ final class LocalReseedServices
                 }
 
                 if (!$matched) {
-                    $row->status = LocalReseedStatusEnums::Pending->value;
-                    $row->message = $verified ? self::composeVerifiedMessage($verified) : '';
-                    $row->save();
-                    if ($verified) {
-                        // 结论同步兄弟行（同hash其他客户端）：免得兄弟行重复下载同一元数据
-                        LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, [
-                            'message' => $row->message,
-                            'search_time' => time(),
+                    // 条件更新（status<>已命中）：本行是以NoMatch/Failed状态载入的旧模型，
+                    // 无条件save会把并发进程刚写入的Matched终态回退成Pending；而cn_reseed已有
+                    // 该hash入队记录时行被NOT EXISTS永久排除，状态机将卡死在“待搜索”
+                    LocalReseed::where('id', (int)$row->id)
+                        ->where('status', '<>', LocalReseedStatusEnums::Matched->value)
+                        ->update([
+                            'status' => LocalReseedStatusEnums::Pending->value,
+                            'keyword' => (string)$row->keyword,
+                            'candidates' => (int)$row->candidates,
+                            'search_time' => (int)$row->search_time,
+                            'message' => $verified ? self::composeVerifiedMessage($verified) : '',
                         ]);
-                    }
+                    // 结论同步兄弟行（同hash其他客户端）：免得兄弟行重复下载同一元数据；
+                    // search_time无条件同步（含NoMatch/Failed兄弟行，它们下轮仍是可扫描行）
+                    LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, $verified ? [
+                        'message' => self::composeVerifiedMessage($verified),
+                        'search_time' => time(),
+                    ] : ['search_time' => time()]);
                     $this->statNoMatch++;
                 }
                 if ($this->budget->timeUp() || $this->budget->siteSliceUp()) {
+                    // 同上：中断出口不能丢掉本批的skipIds
+                    $this->batchClose($skipIds);
                     break 2;
                 }
             }
@@ -766,7 +830,7 @@ final class LocalReseedServices
     }
 
     /**
-     * 组装已核否决列表消息：只保留最近20个ID并截断到900字符
+     * 组装已核否决列表消息：只保留最近VERIFIED_MEMORY_CAP个ID并截断到900字符
      * （无上限累积会撑爆 message varchar(1000)，导致行save反复失败）
      * @param array $verified 已否决的站内种子ID列表
      * @return string
@@ -776,7 +840,7 @@ final class LocalReseedServices
         if (empty($verified)) {
             return '';
         }
-        return mb_substr('已核:' . implode(',', array_slice(array_map('intval', $verified), -20)), 0, 900);
+        return mb_substr('已核:' . implode(',', array_slice(array_map('intval', $verified), -self::VERIFIED_MEMORY_CAP)), 0, 900);
     }
 
     /**
@@ -865,7 +929,26 @@ final class LocalReseedServices
             'subtype' => ReseedSubtypeEnums::Local->value,
             'payload' => (string)$reseedPayload
         ];
-        $reseedModel = Reseed::firstOrCreate($attributes, $values);
+        $reseedModel = null;
+        $lockKey = 'localreseed:enqueue:' . ($this->masterModel ? (int)$this->masterModel->id : (int)$row->client_id) . ':' . $result->infoHash;
+        $connection = null;
+        try {
+            // cn_reseed没有(client_id,info_hash)唯一键：重叠运行的并发进程同时确认同一hash时，
+            // firstOrCreate的select-then-insert会双双插入→同一辅种被投递两次（第二次在下载器侧报重复）。
+            // 用MySQL用户级锁把同(client,hash)的入队串行化；必须取模型自己的连接（plugin.admin.mysql），
+            // 锁与firstOrCreate走同一物理连接才有效
+            $connection = Reseed::query()->getConnection();
+            $connection->select('SELECT GET_LOCK(?, 5)', [$lockKey]);
+            $reseedModel = Reseed::firstOrCreate($attributes, $values);
+        } catch (Throwable) {
+            $reseedModel = Reseed::firstOrCreate($attributes, $values);    // 锁不可用（如非MySQL）时退回裸调用
+        } finally {
+            try {
+                $connection?->select('SELECT RELEASE_LOCK(?)', [$lockKey]);
+            } catch (Throwable) {
+                // 释放失败随连接回收，忽略
+            }
+        }
         $row->reseed_id = (int)$reseedModel->reseed_id;
         $row->status = LocalReseedStatusEnums::Matched->value;
         $row->message = '命中：' . $result->name . ($result->message ? '（' . $result->message . '）' : '');
@@ -959,8 +1042,12 @@ final class LocalReseedServices
             return false;
         }
 
+        $dir = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
         foreach ($this->path_filter as $prefix) {
-            if (str_starts_with(rtrim($directory, DIRECTORY_SEPARATOR), rtrim($prefix, DIRECTORY_SEPARATOR))) {
+            // 目录前缀比较必须带分隔符：纯子串前缀会把 /data 过滤器误命中 /data2/...，
+            // 整目录树的种子被静默排除出辅种范围
+            $p = rtrim((string)$prefix, DIRECTORY_SEPARATOR);
+            if ('' === $p || str_starts_with($dir, $p . DIRECTORY_SEPARATOR)) {
                 return true;
             }
         }

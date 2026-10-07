@@ -4,6 +4,8 @@ namespace app\admin\services\localreseed;
 
 use app\admin\support\NotifyAdmin;
 use app\model\SiteRequestLedger;
+use support\Cache;
+use Throwable;
 
 /**
  * 搜索预算控制器（进程内预算 + 跨进程全局台账）
@@ -111,15 +113,15 @@ final class SearchBudget
 
         $ledger = $this->ledger($site);
         if ($ledger->inCooldown()) {
-            $this->warnOnce($site, '站点熔断中至 ' . date('H:i', (int)$ledger->cooldown_until) . '：' . $site . '（连续失败触发24小时冷却）');
+            $this->warnOnce($site, '站点熔断中至 ' . date('H:i', (int)$ledger->cooldown_until) . '：' . $site . '（连续失败触发24小时冷却）', 'cooldown');
             return false;
         }
         if ($ledger->todayRequests() >= $this->dailyRequests) {
-            $this->warnOnce($site, "站点日限已满：{$site} 今日 {$ledger->todayRequests()}/{$this->dailyRequests} 请求，明日自动恢复");
+            $this->warnOnce($site, "站点日限已满：{$site} 今日 {$ledger->todayRequests()}/{$this->dailyRequests} 请求，明日自动恢复", 'daily');
             return false;
         }
         if (!self::inActiveWindow()) {
-            $this->warnOnce($site, '活跃窗口外(默认09:00-23:00)暂停站点请求：' . $site);
+            $this->warnOnce($site, '活跃窗口外(默认09:00-23:00)暂停站点请求：' . $site, 'window');
             return false;
         }
         // 跨进程最小间隔：距台账最近一次请求不足间隔(含抖动余量)则暂缓
@@ -224,15 +226,32 @@ final class SearchBudget
     }
 
     /**
-     * 每轮每站只提示一次
+     * 每轮每站只提示一次；跨轮推送用文件缓存节流（同一站点同一原因6小时内只推送一次）
+     * 进程级的notifiedOnce挡不住「每轮都是新进程」的高频轮次：熔断24小时/日限/窗口外
+     * 状态每轮重复推送会形成后台通知风暴
+     * @param string $site
+     * @param string $message
+     * @param string $reason 原因标识（cooldown/daily/window），用于缓存键区分
      */
-    private function warnOnce(string $site, string $message): void
+    private function warnOnce(string $site, string $message, string $reason = ''): void
     {
         if (isset($this->notifiedOnce[$site])) {
             return;
         }
         $this->notifiedOnce[$site] = true;
         echo $message . PHP_EOL;
-        NotifyAdmin::warning($message);
+        if ('' === $reason) {
+            NotifyAdmin::warning($message);
+            return;
+        }
+        try {
+            $cacheKey = 'localreseed:warn:' . $reason . ':' . $site;
+            if (!Cache::has($cacheKey)) {
+                Cache::set($cacheKey, time(), 21600);    // 6小时内同因同站不重复推送
+                NotifyAdmin::warning($message);
+            }
+        } catch (Throwable) {
+            NotifyAdmin::warning($message);    // 缓存不可用时退化为直接推送
+        }
     }
 }
