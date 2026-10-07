@@ -43,6 +43,12 @@ return [
         'handler' => process\ReseedProcess::class,
         'constructor' => [],
     ],
+    // 本地辅种常驻触发进程：不依赖plugin/cron调度器(其内存状态不可靠)，固定节奏spawn+命令级flock互斥
+    'localreseed-ticker' => [
+        'workerClass' => plugin\cron\app\Worker::class,
+        'handler' => process\LocalReseedTicker::class,
+        'constructor' => [],
+    ],
     // 视听云
     'cloud' => [
         'workerClass' => plugin\cron\app\Worker::class,
