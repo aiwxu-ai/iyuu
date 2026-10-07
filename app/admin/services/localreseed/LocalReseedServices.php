@@ -293,8 +293,10 @@ final class LocalReseedServices
             return;
         }
 
-        // 本站时间片内引导搜索的截止
-        $guidedDeadline = microtime(true) + ($this->budget->remainingSeconds() * self::SEARCH_GUIDED_SLICE_RATIO);
+        // 本站时间片内引导搜索的截止（配额基数取"整轮剩余"与"本站时间片剩余"的较小者：
+        // 多站场景下时间片远小于整轮剩余，用整轮剩余计算会使40%上限永不生效）
+        $sliceRemaining = min($this->budget->remainingSeconds(), $this->budget->sliceRemainingSeconds());
+        $guidedDeadline = microtime(true) + ($sliceRemaining * self::SEARCH_GUIDED_SLICE_RATIO);
         $minTs = time() - self::SEARCH_GUIDED_REQUEUE_SECONDS;
         $lastId = 0;
         $searched = 0;
@@ -567,25 +569,27 @@ final class LocalReseedServices
                 if (isset($verifyCache[$hash]['ok'])) {
                     $cachedOk = $verifyCache[$hash]['ok'];
                     $this->enqueue($row, $site, MatchResult::matched((int)$cachedOk[0], (string)$cachedOk[1], (string)$cachedOk[2], 1));
-                    $this->statMatched++;
                     continue;
                 }
                 $cachedNo = $verifyCache[$hash]['no'] ?? [];
 
                 // 候选查找第一遍：标题键全等 + latin第二键（本地中文名的拉丁尾部 ↔ 站内行）
-                $candidates = $index[$key] ?? [];
+                // 统一按torrent_id建映射去重：列表下标(0,1,2...)与torrent_id数值撞车时会静默覆盖掉全等候选
+                $candidates = [];
+                foreach (($index[$key] ?? []) as $c) {
+                    $candidates[(int)$c['torrent_id']] = $c;
+                }
                 if ($passExact) {
                     $lk = TitleNormalizer::latinKey((string)$row->torrent_name);
                     if ('' !== $lk) {
                         foreach ([$index[$lk] ?? [], $latinIndex[$lk] ?? []] as $extra) {
                             foreach ($extra as $c) {
-                                $candidates[$c['torrent_id']] = $c;    // 按tid去重合并
+                                $candidates[(int)$c['torrent_id']] = $c;    // 按tid去重合并
                             }
                         }
                     }
                     $candidates = array_values($candidates);
-                    $hasExact = 0 !== count($candidates);
-                    if (!$hasExact) {
+                    if ([] === $candidates) {
                         continue;    // 第一遍只处理有全等候选的行
                     }
                 } else {
@@ -778,15 +782,15 @@ final class LocalReseedServices
         $this->statMatchedHashes++;
 
         // 兄弟行：同hash其他客户端（master模式下入队同一目标客户端时firstOrCreate天然去重）
+        // Pending/NoMatch/Failed都要覆盖：NoMatch/Failed兄弟行本轮不扫（或已被NOT EXISTS排除），漏掉会延迟一轮才辅种
         if (!$this->masterModel) {
             $siblings = LocalReseed::where('info_hash', '=', (string)$row->info_hash)
                 ->where('target_sid', '=', $site->sid)
                 ->where('id', '<>', (int)$row->id)
-                ->where('status', '=', LocalReseedStatusEnums::Pending->value)
+                ->whereIn('status', [LocalReseedStatusEnums::Pending->value, LocalReseedStatusEnums::NoMatch->value, LocalReseedStatusEnums::Failed->value])
                 ->get();
             foreach ($siblings as $sibling) {
                 $this->enqueue($sibling, $site, $result);
-                $this->statMatched++;
             }
         }
     }

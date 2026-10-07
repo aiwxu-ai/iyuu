@@ -89,6 +89,14 @@ final class SearchBudget
     }
 
     /**
+     * 当前站点时间片剩余秒数
+     */
+    public function sliceRemainingSeconds(): float
+    {
+        return max(0, $this->siteDeadline - microtime(true));
+    }
+
+    /**
      * 站点是否还允许发起请求
      * 检查链：时间片→轮时间→轮请求上限→台账(熔断/日限/跨进程间隔/活跃窗口)
      */
@@ -124,17 +132,24 @@ final class SearchBudget
 
     /**
      * 记录一次请求并休眠到间隔满足
-     * 顺序：先记账(即使后续请求失败也计费) → 按进程内最近请求时刻补足间隔
+     * 顺序：先记账(即使后续请求失败也计费) → 休眠 → 发请求
+     * 休眠必须保证"距本次记账 ≥ interval"：allow()的台账间隔判定以记账时刻为准，
+     * 若只按抖动间隔休眠(可能小于interval甚至首次不休眠)，下一次allow()必然返回false，
+     * 调用方会误判为预算耗尽而整轮提前退出（每站每阶段只剩1个请求）
      */
     public function hit(string $site): void
     {
+        $chargedAt = microtime(true);
         SiteRequestLedger::charge($site);
         unset($this->ledgerCache[$site]);    // 缓存失效，下次allow重新读
         $this->perSite[$site] = ($this->perSite[$site] ?? 0) + 1;
 
-        $interval = $this->jitteredInterval();
-        $last = $this->lastHitAt[$site] ?? 0.0;
-        $wait = $interval - (microtime(true) - $last);
+        // 休眠到 max(距本次记账≥interval, 距上一请求≥抖动间隔)，两者都满足才放行
+        $now = microtime(true);
+        $wait = max(
+            $chargedAt + $this->interval - $now,
+            $this->jitteredInterval() - ($now - ($this->lastHitAt[$site] ?? 0.0))
+        );
         if ($wait > 0) {
             usleep((int)($wait * 1000000));
         }
@@ -142,11 +157,11 @@ final class SearchBudget
     }
 
     /**
-     * 带抖动的间隔(±40%)：固定节律是爬虫签名
+     * 带抖动的间隔(最小间隔之上叠加0~+40%随机量)：固定节律是爬虫签名
      */
     private function jitteredInterval(): float
     {
-        return $this->interval * mt_rand(60, 140) / 100;
+        return $this->interval * mt_rand(100, 140) / 100;
     }
 
     /**

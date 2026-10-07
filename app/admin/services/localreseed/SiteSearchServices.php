@@ -86,7 +86,11 @@ final class SiteSearchServices
 
         // 退路：任一侧hash缺失(v2-only等)时体积全等 + 标注size-only（可能有同体积异种风险）
         if ((int)$torrentFile->getSize() === $localSize) {
-            return MatchResult::matched((int)$candidate['torrent_id'], strtolower($siteHash ?: $localHash), (string)($candidate['title'] ?? ''), 1, 'size-only');
+            // 入队hash必须是"实际投递给下载器的种子"的客户端可见hash：
+            // 站种子v2-only时getInfoHashV1为空，此时用截断v2哈希（qB/Tr对v2种子的显示口径），
+            // 否则下游ReseedDownloadServices按本地v1哈希打标签/发校验命令会打在客户端里不存在的种子上
+            $enqueueHash = $siteHash ?: substr((string)$torrentFile->getInfoHashV2(), 0, 40);
+            return MatchResult::matched((int)$candidate['torrent_id'], strtolower($enqueueHash ?: $localHash), (string)($candidate['title'] ?? ''), 1, 'size-only');
         }
         return MatchResult::noMatch(1, '元数据体积不符：' . $torrentFile->getSize() . ' vs ' . $localSize);
     }

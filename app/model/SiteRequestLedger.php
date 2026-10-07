@@ -4,6 +4,7 @@ namespace app\model;
 
 use Illuminate\Database\Eloquent\Builder;
 use plugin\admin\app\model\Base;
+use Throwable;
 
 /**
  * 站点请求全局台账
@@ -59,7 +60,7 @@ class SiteRequestLedger extends Base
     }
 
     /**
-     * 取站点台账行（无则新建）
+     * 取站点台账行（无则新建；并发进程同时首建时靠uk_site唯一键去重）
      * @param string $site
      * @return self
      */
@@ -71,7 +72,16 @@ class SiteRequestLedger extends Base
             $model = new static();
             $model->site = $site;
             $model->day = date('Y-m-d');
-            $model->save();
+            try {
+                $model->save();
+            } catch (Throwable) {
+                // 并发进程抢先建行触发唯一键冲突：重取现有行，避免异常炸掉整轮任务
+                /** @var self|null $existing */
+                $existing = static::where('site', '=', $site)->first();
+                if (null !== $existing) {
+                    $model = $existing;
+                }
+            }
         }
         return $model;
     }

@@ -4,6 +4,7 @@ namespace app\admin\services\localreseed;
 
 use app\model\Site;
 use app\model\SiteIndex;
+use app\model\SiteRequestLedger;
 use app\model\SiteTorrent;
 use DOMDocument;
 use DOMXPath;
@@ -61,6 +62,7 @@ final class SiteIndexCrawler
         $newRows = 0;
         $fullDone = false;
         $emptyStreak = 0;
+        $parseAnomalyStreak = 0;
         while ($pages < $maxPages && $this->budget->allow($this->site->site)) {
             // 先记账再请求：失败的请求同样计入预算与台账
             $this->budget->hit($this->site->site);
@@ -73,6 +75,10 @@ final class SiteIndexCrawler
                 $pageHasTable = str_contains($html, 'torrentname') || str_contains($html, 'details.php?id=');
                 if ($pageHasTable) {
                     $emptyStreak = 0;    // 解析异常，不当到底
+                    // 连续解析异常也三振出局：否则模板一变每轮都会把整站翻页预算烧光
+                    if (++$parseAnomalyStreak >= self::FULL_DONE_EMPTY_STREAK) {
+                        break;
+                    }
                 } elseif (++$emptyStreak >= self::FULL_DONE_EMPTY_STREAK && $fullMode) {
                     $fullDone = true;
                 }
@@ -83,6 +89,7 @@ final class SiteIndexCrawler
                 continue;
             }
             $emptyStreak = 0;
+            $parseAnomalyStreak = 0;
 
             // 分页器最大页码：已到尾页则全库完成（NexusPHP超尾页会钳制回最后一页，不能靠空页判断）
             if ($fullMode && preg_match_all('/[?&]page=(\d+)/', $html, $mPages)) {
@@ -133,16 +140,20 @@ final class SiteIndexCrawler
         $this->applyCurlOptions($curl);
         $curl->get($this->domain() . '/torrents.php?incldead=' . $this->incldead . '&page=' . $page);
         if (!$curl->isSuccess() || empty($curl->response)) {
+            SiteRequestLedger::fail($this->site->site);
             throw new RuntimeException('抓取列表页失败 page=' . $page . ' http=' . $curl->http_status_code);
         }
 
         $html = (string)$curl->response;
         if (str_contains($html, 'Just a moment') || str_contains($html, 'cf-challenge')) {
+            SiteRequestLedger::fail($this->site->site);
             throw new CookieInvalidException('站点触发Cloudflare挑战：' . $this->site->site . '（cookie含cf_clearance可能过期）');
         }
         if (!str_contains($html, 'torrentname') && str_contains($html, 'login.php')) {
+            SiteRequestLedger::fail($this->site->site);
             throw new CookieInvalidException('站点cookie已失效：' . $this->site->site);
         }
+        SiteRequestLedger::success($this->site->site);    // 成功请求重置熔断计数：散发的元数据超时不再跨小时累积误熔断
         return $html;
     }
 
@@ -159,16 +170,20 @@ final class SiteIndexCrawler
         $this->applyCurlOptions($curl);
         $curl->get($this->domain() . '/torrents.php?incldead=' . $this->incldead . '&search=' . rawurlencode($term) . '&page=' . $page);
         if (!$curl->isSuccess() || empty($curl->response)) {
+            SiteRequestLedger::fail($this->site->site);
             throw new RuntimeException('搜索请求失败 term=' . $term . ' http=' . $curl->http_status_code);
         }
 
         $html = (string)$curl->response;
         if (str_contains($html, 'Just a moment') || str_contains($html, 'cf-challenge')) {
+            SiteRequestLedger::fail($this->site->site);
             throw new CookieInvalidException('站点触发Cloudflare挑战：' . $this->site->site . '（cookie含cf_clearance可能过期）');
         }
         if (!str_contains($html, 'torrentname') && str_contains($html, 'login.php')) {
+            SiteRequestLedger::fail($this->site->site);
             throw new CookieInvalidException('站点cookie已失效：' . $this->site->site);
         }
+        SiteRequestLedger::success($this->site->site);
         return $this->parse($html);
     }
 
