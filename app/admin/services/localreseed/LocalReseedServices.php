@@ -239,7 +239,7 @@ final class LocalReseedServices
             }
             // 阶段A2 关键词引导搜索（IYUU跨站已验证hash优先，用剩余预算）
             try {
-                $this->searchGuided($site);
+                $this->searchGuided($clientIds, $site);
             } catch (Throwable $throwable) {
                 echo "站点 {$site->nickname} 引导搜索异常：" . $throwable->getMessage() . PHP_EOL;
                 NotifyAdmin::warning("站点 {$site->site} 引导搜索异常：" . mb_substr($throwable->getMessage(), 0, 300));
@@ -295,7 +295,7 @@ final class LocalReseedServices
      * @param Site $site
      * @return void
      */
-    protected function searchGuided(Site $site): void
+    protected function searchGuided(array $client_ids, Site $site): void
     {
         // 站点限速配置抬升间隔
         try {
@@ -327,12 +327,20 @@ final class LocalReseedServices
                 break;
             }
 
-            /** @var LocalReseed[] $rows 只处理IYUU已跨站验证过的hash，按hash去重（每hash取代表行） */
+            /** @var LocalReseed[] $rows 只处理IYUU已跨站验证过的hash，按hash去重（每hash取代表行）
+             *  client过滤+已入队排他与scanRows同口径：否则其他任务的client行/master模式孤儿行
+             *  会因EXISTS命中本管线自己写的cn_reseed记录被每12小时永久重搜重验 */
+            $reseedClientId = $this->masterModel ? (int)$this->masterModel->id : -1;
+            $notEnqueued = $reseedClientId > 0
+                ? "NOT EXISTS (SELECT 1 FROM cn_reseed cr WHERE cr.client_id = {$reseedClientId} AND cr.info_hash = cn_local_reseed.info_hash)"
+                : 'NOT EXISTS (SELECT 1 FROM cn_reseed cr WHERE cr.client_id = cn_local_reseed.client_id AND cr.info_hash = cn_local_reseed.info_hash)';
             $ids = LocalReseed::where('target_sid', '=', $site->sid)
+                ->whereIn('client_id', $client_ids)
                 ->where('status', '=', LocalReseedStatusEnums::Pending->value)
                 ->where('torrent_size', '>', 0)
                 ->where('search_time', '<', $minTs)
                 ->whereRaw("EXISTS (SELECT 1 FROM cn_reseed r WHERE r.info_hash = cn_local_reseed.info_hash AND r.info_hash <> '')")
+                ->whereRaw($notEnqueued)
                 ->where('id', '>', $lastId)
                 ->selectRaw('MIN(id) AS id')
                 ->groupBy('info_hash')
@@ -887,17 +895,16 @@ final class LocalReseedServices
         $this->enqueue($row, $site, $result);
         $this->statMatchedHashes++;
 
-        // 兄弟行：同hash其他客户端（master模式下入队同一目标客户端时firstOrCreate天然去重）
+        // 兄弟行：同hash其他客户端（master模式入队同一目标客户端时firstOrCreate天然去重，但仍要标记Matched——
+        // 否则兄弟行被scanRows的NOT EXISTS排除后永远Pending，searchGuided的EXISTS会每12小时重搜重验同一hash）
         // Pending/NoMatch/Failed都要覆盖：NoMatch/Failed兄弟行本轮不扫（或已被NOT EXISTS排除），漏掉会延迟一轮才辅种
-        if (!$this->masterModel) {
-            $siblings = LocalReseed::where('info_hash', '=', (string)$row->info_hash)
-                ->where('target_sid', '=', $site->sid)
-                ->where('id', '<>', (int)$row->id)
-                ->whereIn('status', [LocalReseedStatusEnums::Pending->value, LocalReseedStatusEnums::NoMatch->value, LocalReseedStatusEnums::Failed->value])
-                ->get();
-            foreach ($siblings as $sibling) {
-                $this->enqueue($sibling, $site, $result);
-            }
+        $siblings = LocalReseed::where('info_hash', '=', (string)$row->info_hash)
+            ->where('target_sid', '=', $site->sid)
+            ->where('id', '<>', (int)$row->id)
+            ->whereIn('status', [LocalReseedStatusEnums::Pending->value, LocalReseedStatusEnums::NoMatch->value, LocalReseedStatusEnums::Failed->value])
+            ->get();
+        foreach ($siblings as $sibling) {
+            $this->enqueue($sibling, $site, $result);
         }
     }
 
