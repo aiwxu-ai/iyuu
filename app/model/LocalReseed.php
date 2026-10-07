@@ -87,6 +87,7 @@ class LocalReseed extends Base
     /**
      * 终态同步到兄弟行：同hash同站在多个下载器各有一行，一处得出结论全家共享
      * （跨轮的去重通道：进程内verifyCache只在单轮有效）
+     * Pending/NoMatch/Failed都要覆盖：NoMatch/Failed兄弟行下一轮仍会被重扫，漏掉会重复下载同一元数据
      * @param string $infoHash
      * @param int $targetSid
      * @param int $exceptId 已单独落库的行ID
@@ -101,7 +102,7 @@ class LocalReseed extends Base
         return static::where('info_hash', '=', $infoHash)
             ->where('target_sid', '=', $targetSid)
             ->where('id', '<>', $exceptId)
-            ->where('status', '=', LocalReseedStatusEnums::Pending->value)
+            ->whereIn('status', [LocalReseedStatusEnums::Pending->value, LocalReseedStatusEnums::NoMatch->value, LocalReseedStatusEnums::Failed->value])
             ->update($attrs);
     }
 

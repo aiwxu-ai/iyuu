@@ -63,11 +63,13 @@ final class SiteIndexCrawler
         $fullDone = false;
         $emptyStreak = 0;
         $parseAnomalyStreak = 0;
+        $lastFetched = -1;
         while ($pages < $maxPages && $this->budget->allow($this->site->site)) {
             // 先记账再请求：失败的请求同样计入预算与台账
             $this->budget->hit($this->site->site);
             $html = $this->fetchPage($page);
             $pages++;
+            $lastFetched = $page;
 
             $rows = $this->parse($html);
             if (empty($rows)) {
@@ -117,8 +119,10 @@ final class SiteIndexCrawler
             $page++;
         }
 
-        if ($page > (int)$state->last_page) {
-            $state->last_page = $page;
+        // 断点续跑off-by-one修复：last_page必须记「最后一个已抓取页」，
+        // 记成「下一个未抓取页」会让每轮被中断的全库任务永久跳过一页
+        if ($lastFetched > (int)$state->last_page) {
+            $state->last_page = $lastFetched;
         }
         if ($fullDone) {
             $state->full_done = 1;

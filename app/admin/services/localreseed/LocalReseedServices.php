@@ -370,6 +370,13 @@ final class LocalReseedServices
                 $localSize = (int)$row->torrent_size;
                 $cands = array_values(array_filter($resultRows, static fn($c) => (int)$c['size_bytes'] > 0 && TitleNormalizer::sizeClose((int)$c['size_bytes'], $localSize)));
                 usort($cands, static fn($a, $b) => abs((int)$a['size_bytes'] - $localSize) <=> abs((int)$b['size_bytes'] - $localSize));
+                $verified = [];
+                if (preg_match('/已核:([\d,]+)/u', (string)$row->message, $mV)) {
+                    $verified = array_map('intval', explode(',', $mV[1]));
+                }
+                // 已否决候选直接排除（跨轮message记忆+进程内缓存）：否则每次12小时重搜都会重复下载同一元数据
+                $cachedNo = $this->siteVerifyCache[$hash]['no'] ?? [];
+                $cands = array_values(array_filter($cands, static fn($c) => !in_array((int)$c['torrent_id'], $verified, true) && !in_array((int)$c['torrent_id'], $cachedNo, true)));
                 foreach (array_slice($cands, 0, 2) as $cand) {
                     if (!$this->budget->allow($site->site)) {
                         break;
@@ -394,12 +401,21 @@ final class LocalReseedServices
                         break;
                     }
                     if (LocalReseedStatusEnums::NoMatch === $result->status) {
+                        // 否决结论必须落库并同步兄弟行：只在内存缓存里下轮会重复下载同一元数据
+                        $verified[] = (int)$cand['torrent_id'];
                         $this->siteVerifyCache[$hash]['no'][] = (int)$cand['torrent_id'];
                     }
                     // Failed(瞬时失败)不记录——下一轮自然重试
                 }
 
                 if (LocalReseedStatusEnums::Matched->value !== (int)$row->status) {
+                    if ($verified) {
+                        $row->message = self::composeVerifiedMessage($verified);
+                        LocalReseed::syncSiblings($hash, (int)$site->sid, (int)$row->id, [
+                            'message' => $row->message,
+                            'search_time' => time(),
+                        ]);
+                    }
                     $row->save();
                 }
             }
@@ -678,6 +694,11 @@ final class LocalReseedServices
                         continue;
                     }
                     if (!$this->budget->allow($site->site)) {
+                        // 预算耗尽也要落库本轮否决记忆，否则下轮重复下载同一元数据
+                        if ($verified) {
+                            $row->message = self::composeVerifiedMessage($verified);
+                            $row->save();
+                        }
                         echo "校验预算耗尽(used={$this->budget->used($site->site)})，停止扫描" . PHP_EOL;
                         break 2;
                     }
@@ -714,7 +735,7 @@ final class LocalReseedServices
 
                 if (!$matched) {
                     $row->status = LocalReseedStatusEnums::Pending->value;
-                    $row->message = $verified ? '已核:' . implode(',', $verified) : '';
+                    $row->message = $verified ? self::composeVerifiedMessage($verified) : '';
                     $row->save();
                     if ($verified) {
                         // 结论同步兄弟行（同hash其他客户端）：免得兄弟行重复下载同一元数据
@@ -735,6 +756,20 @@ final class LocalReseedServices
                 break;
             }
         }
+    }
+
+    /**
+     * 组装已核否决列表消息：只保留最近20个ID并截断到900字符
+     * （无上限累积会撑爆 message varchar(1000)，导致行save反复失败）
+     * @param array $verified 已否决的站内种子ID列表
+     * @return string
+     */
+    protected static function composeVerifiedMessage(array $verified): string
+    {
+        if (empty($verified)) {
+            return '';
+        }
+        return mb_substr('已核:' . implode(',', array_slice(array_map('intval', $verified), -20)), 0, 900);
     }
 
     /**
@@ -887,6 +922,8 @@ final class LocalReseedServices
 
     /**
      * transmission做种列表（getTorrentList无体积字段，用getList自行过滤）
+     * 状态口径与qB侧(pausedUP/stalledUP/queuedUP)对齐：6=做种中、5=排队做种、
+     * 0=暂停——数据完整的暂停/排队种子同样是合法辅种源，只收6会让长期暂停的完整种子永久缺席
      * @param \Iyuu\BittorrentClient\Clients $clients
      * @return array
      */
@@ -895,7 +932,9 @@ final class LocalReseedServices
         $rows = $clients->getList();
         $rs = [];
         foreach ($rows as $row) {
-            if (6 === (int)($row['status'] ?? -1)) {
+            $status = (int)($row['status'] ?? -1);
+            $done = 1.0 <= (float)($row['percentDone'] ?? 0.0);
+            if (6 === $status || ($done && (0 === $status || 5 === $status))) {
                 $rs[$row['hashString']] = $row;
             }
         }
